@@ -1,0 +1,47 @@
+name: Build Nora Studio Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Verify release tag matches version
+        shell: pwsh
+        run: |
+          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $iss = Get-Content 'windows/NoraStudio.iss' -Raw
+          if ($iss -notmatch [regex]::Escape('#define AppVersion "' + $tagVersion + '"')) {
+            throw 'Release tag does not match windows/NoraStudio.iss AppVersion.'
+          }
+
+      - name: Build EXE and installer
+        shell: cmd
+        run: call windows\Build-Installer.bat --no-pause
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $asset = "installer-output/NoraStudio-Setup-$version.exe"
+          if (-not (Test-Path $asset)) { throw "Installer not found: $asset" }
+          gh release create '${{ github.ref_name }}' $asset --title "Nora Studio $version" --generate-notes

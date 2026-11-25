@@ -1,0 +1,7 @@
+{
+  "port": 8765,
+  "adminToken": "",
+  "unityRepo": "",
+  "codexEnabled": false,
+  "autoRunApprovedTasks": false
+}

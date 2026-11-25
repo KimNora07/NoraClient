@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nora Studio</title>
+<style>
+:root{font-family:system-ui,'Malgun Gothic',sans-serif;color:#e8edf8;background:#0d1220}
+*{box-sizing:border-box}body{max-width:1100px;margin:40px auto;padding:0 18px}h1{margin-bottom:2px}
+.muted{color:#9daac4}.panel{background:#171f31;border:1px solid #303d55;border-radius:14px;padding:18px;margin:18px 0}
+input,textarea{background:#0e1524;border:1px solid #46516a;border-radius:8px;color:white;padding:10px;width:100%;margin:6px 0 12px;font:inherit}
+textarea{min-height:75px}button{border:0;border-radius:8px;background:#647af5;color:#fff;padding:10px 15px;cursor:pointer;margin:5px 6px 5px 0}button.secondary{background:#38465d}button:disabled{opacity:.45;cursor:not-allowed}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}.task{border-top:1px solid #344057;padding:14px 0}.status{display:inline-block;background:#324467;border-radius:20px;padding:3px 10px;font-size:12px}pre{white-space:pre-wrap;word-break:break-word;background:#0d1424;border-radius:8px;padding:12px;max-height:270px;overflow:auto}small{color:#aab5c9}
+@media(max-width:720px){.cols{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>✦ Nora Studio</h1><p class="muted">승인 기반 AI 게임 개발 스튜디오 · 로컬 MVP</p></header>
+<div class="panel"><label>관리 토큰 (서버의 NORA_TOKEN)</label><input id="token" type="password" placeholder="토큰 입력"><button onclick="connectStudio()">연결 및 새로고침</button><span id="health" class="muted"></span></div>
+<div class="cols">
+<section class="panel"><h2>AI 운영실장에게 기획 요청</h2><textarea id="idea" placeholder="예: Arcadia 차원 사건 노드의 기본 C# 데이터 구조를 만들어줘"></textarea><button onclick="propose()">로컬 AI로 업무 초안 작성</button><small>이 버튼은 승인하거나 코드를 실행하지 않습니다.</small></section>
+<section class="panel"><h2>업무 등록</h2><label>제목</label><input id="title" placeholder="업무 제목"><label>요구사항</label><textarea id="description" placeholder="수정 범위를 구체적으로 적어주세요"></textarea><label>완료 조건</label><textarea id="acceptance" placeholder="검증 가능한 조건을 적어주세요"></textarea><button onclick="createTask()">초안 저장</button></section>
+</div>
+<section class="panel"><h2>작업 대기열</h2><p class="muted">승인한 업무만 실행 가능하며, Codex는 별도 Git worktree에서 실행됩니다.</p><button onclick="runNext()" class="secondary">승인 작업 1개 실행</button><button onclick="loadTasks()" class="secondary">새로고침</button><div id="tasks"></div></section>
+<script>
+const $=id=>document.getElementById(id);
+const escapeHtml=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let token='';
+async function api(path,options={}){const r=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json','X-Nora-Token':token,...(options.headers||{})}});let body=await r.json().catch(()=>({}));if(!r.ok)throw Error(body.detail||'Request failed');return body}
+function err(e){alert(e.message)}
+async function connectStudio(){token=$('token').value;try{const h=await api('/health');$('health').textContent=`연결됨 · ${h.model} · Codex ${h.codex_enabled?'ON':'OFF'} · 자동실행 ${h.auto_run?'ON':'OFF'}`;loadTasks()}catch(e){err(e)}}
+async function propose(){try{const p=await api('/plan',{method:'POST',body:JSON.stringify({idea:$('idea').value})});$('title').value=p.title;$('description').value=p.description;$('acceptance').value=p.acceptance}catch(e){err(e)}}
+async function createTask(){try{await api('/tasks',{method:'POST',body:JSON.stringify({title:$('title').value,description:$('description').value,acceptance:$('acceptance').value})});loadTasks()}catch(e){err(e)}}
+async function act(id,action){if(action==='approve'&&!confirm(`업무 #${id}를 승인하시겠습니까? Codex 실행이 활성화된 환경에서는 자동 실행될 수 있습니다.`))return;try{await api(`/tasks/${id}/${action}`,{method:'POST'});loadTasks()}catch(e){err(e)}}
+async function runNext(){if(!confirm('승인된 작업 하나를 Codex에 실행 요청하시겠습니까?'))return;try{await api('/run-next',{method:'POST'});setTimeout(loadTasks,1200)}catch(e){err(e)}}
+async function loadTasks(){try{const arr=await api('/tasks');$('tasks').innerHTML=arr.map(t=>`<article class="task"><span class="status">${escapeHtml(t.status)}</span> <strong>#${t.id} ${escapeHtml(t.title)}</strong><p>${escapeHtml(t.description)}</p><small>완료 조건: ${escapeHtml(t.acceptance)}</small><p>${t.status==='draft'?`<button onclick="act(${t.id},'approve')">승인</button><button class="secondary" onclick="act(${t.id},'reject')">반려</button>`:''}</p>${t.branch?`<small>브랜치: ${escapeHtml(t.branch)}</small>`:''}${t.log?`<details><summary>실행 로그 보기</summary><pre>${escapeHtml(t.log)}</pre></details>`:''}</article>`).join('')||'<p class="muted">등록된 업무가 없습니다.</p>'}catch(e){err(e)}}
+setInterval(()=>{if(token)loadTasks()},12000);
+</script></body></html>
