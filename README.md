@@ -1,4 +1,4 @@
-# Nora Studio v0.3.3 — GitHub Releases 원클릭 업데이트
+# Nora Studio v0.3.4 — Windows Codex 실행 안정화
 
 ## 정식 Windows 설치 마법사 만들기 (NEW)
 
@@ -13,7 +13,7 @@
 빌드가 성공하면 아래 파일이 생성됩니다.
 
 ```text
-nora-studio/installer-output/NoraStudio-Setup-0.3.3.exe
+nora-studio/installer-output/NoraStudio-Setup-0.3.4.exe
 ```
 
 ### 설치 마법사가 제공하는 기능
@@ -105,10 +105,10 @@ Windows PC / RTX 3070 Ti Laptop 8GB VRAM / RAM 32GB에 맞춘 로컬 운영실�
 - **v0.3.2 구현률(별도 지표)**: 업무의 완료 조건을 줄별로 분리하고, Codex가 작업 공간에 생성하는 `.nora-progress.json`의 자기 보고 항목을 Git 변경 파일의 실제 존재 여부와 대조합니다. 증거가 확인된 항목 수 / 전체 항목 수를 `AI 보고 구현 기준 충족률`로 표시하며, 근거가 없으면 `측정 대기`로 표시합니다. 코드 품질·Unity 컴파일·테스트 성공의 독립적인 증명은 아닙니다.
 - **v0.3.3 GitHub Releases 업데이트**: 관리자 계정의 `회사 설정 → 앱 업데이트`에서 새 버전을 확인하고, 한 번의 설치 승인으로 다운로드·검증·설치를 진행합니다. 실제 설치된 Windows EXE에서만 활성화됩니다.
 
-## GitHub Releases 자동 업데이트 연결 (v0.3.3)
+## GitHub Releases 자동 업데이트 연결 (v0.3.4)
 
 1. `nora-studio` **폴더의 내용**을 GitHub **공개 저장소의 루트**에 업로드합니다. `config.json`, `studio.sqlite3`, 관리자 토큰이나 개인 게임 소스는 절대로 공개 저장소에 올리지 마세요.
-2. 저장소에 `.github/workflows/windows-release.yml`이 포함되었는지 확인합니다. 이 워크플로는 `v0.3.3` 같은 태그를 푸시하면 Windows 빌드 후 같은 이름의 GitHub Release에 `NoraStudio-Setup-0.3.3.exe`를 게시합니다. Actions의 `contents: write` 권한이 필요합니다.
+2. 저장소에 `.github/workflows/windows-release.yml`이 포함되었는지 확인합니다. 이 워크플로는 `v0.3.4` 같은 태그를 푸시하면 Windows 빌드 후 같은 이름의 GitHub Release에 `NoraStudio-Setup-0.3.4.exe`를 게시합니다. Actions의 `contents: write` 권한이 필요합니다.
 3. 먼저 이 버전의 설치 파일을 GitHub Actions에서 빌드하거나 Windows PC에서 `windows/Build-Installer.bat`으로 빌드하여 **최초 1회 수동 설치**합니다.
 4. `%LOCALAPPDATA%\NoraStudio\config.json`에 아래처럼 저장소를 추가하고 앱을 다시 실행합니다. 다른 설정과 관리자 토큰은 유지하세요.
 

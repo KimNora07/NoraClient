@@ -1,6 +1,51 @@
 import importlib
 
 
+def test_windows_npm_codex_resolves_through_node(tmp_path, monkeypatch):
+    m = importlib.import_module("studio.app")
+    npm = tmp_path / "npm"
+    js = npm / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+    js.parent.mkdir(parents=True)
+    js.write_text("// CLI entry")
+    shim = npm / "codex.cmd"
+    shim.write_text("@echo off")
+    node = tmp_path / "node.exe"
+    node.touch()
+    git = tmp_path / "git.exe"
+    git.touch()
+    monkeypatch.setattr(m.shutil, "which", lambda name: {
+        "git": str(git), "codex.exe": None, "codex.cmd": str(shim), "node.exe": str(node)
+    }.get(name))
+    resolved_git, codex = m.tool_commands()
+    assert resolved_git == str(git)
+    assert codex == [str(node), str(js)]
+
+
+def test_tool_resolution_reports_missing_codex(tmp_path, monkeypatch):
+    import pytest
+    m = importlib.import_module("studio.app")
+    git = tmp_path / "git.exe"
+    git.touch()
+    monkeypatch.setattr(m.shutil, "which", lambda name: str(git) if name == "git" else None)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="Codex CLI"):
+        m.tool_commands()
+
+
+def test_stream_codex_prompt_uses_stdin(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setenv("NORA_DATA", str(tmp_path))
+    m = importlib.reload(importlib.import_module("studio.app"))
+    m.init_db()
+    task = m.create_task(m.TaskInput(title="Read stdin", description="Read approved input", acceptance="Output matches"))
+    m.transition(task["id"], "draft", "approved")
+    m.transition(task["id"], "approved", "running")
+    code, output = m.stream_codex(task["id"], [sys.executable, "-c", "import sys; print(sys.stdin.read())"], tmp_path, prompt="approved input")
+    assert code == 0
+    assert "approved input" in output
+
+
 def test_approval_gate(tmp_path, monkeypatch):
     monkeypatch.setenv("NORA_DATA", str(tmp_path))
     monkeypatch.setenv("NORA_TOKEN", "test-secret")

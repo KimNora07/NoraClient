@@ -28,7 +28,7 @@
 <script>
 const NAV=[['dashboard','◫','CEO 대시보드'],['projects','▦','프로젝트'],['tasks','☷','업무 관리'],['agents','♙','AI 직원'],['approvals','✓','전자결재'],['settings','⚙','설정']];
 let screen='dashboard',token='',guest=false,store={tasks:[],projects:[],agents:[],approvals:{pending:[],history:[]},dashboard:null,health:null};
-let releaseInfo={configured:false,available:false,current:'0.3.3'},updateBusy=false;
+let releaseInfo={configured:false,available:false,current:'0.3.4'},updateBusy=false;
 const $=id=>document.getElementById(id),e=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const statusName={draft:'승인 대기',approved:'실행 대기',running:'개발 중',review:'최종 검토',done:'완료',failed:'실패',rejected:'반려',interrupted:'중단',changes_requested:'수정 요청',disabled:'비활성'};
 const workflowPercent=t=>t.status==='done'?100:Math.max(0,Math.min(85,Number(t.progress)||0));

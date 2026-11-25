@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -184,6 +185,50 @@ def command(args, cwd, timeout=30):
                           errors="replace", timeout=timeout, check=False)
 
 
+def find_executable(name, extra_paths=()):
+    """Resolve a tool independently of the frozen desktop app's search path."""
+    discovered = shutil.which(name)
+    if discovered:
+        return str(Path(discovered).resolve())
+    for candidate in extra_paths:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate).resolve())
+    return None
+
+
+def tool_commands():
+    """Use absolute paths; never pass task text through a Windows batch shell."""
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    local = os.environ.get("LOCALAPPDATA", "")
+    roaming = os.environ.get("APPDATA", "")
+    git = find_executable("git", [
+        Path(program_files) / "Git" / "cmd" / "git.exe",
+        Path(local) / "Programs" / "Git" / "cmd" / "git.exe" if local else None,
+    ])
+    if not git:
+        raise FileNotFoundError("Git 실행 파일을 찾을 수 없습니다. Git for Windows를 설치하고 Nora Studio를 재시작하세요.")
+
+    codex = find_executable("codex.exe")
+    if codex:
+        return git, [codex]
+    shim = find_executable("codex.cmd", [
+        Path(roaming) / "npm" / "codex.cmd" if roaming else None,
+        Path(local) / "npm" / "codex.cmd" if local else None,
+    ])
+    if shim:
+        # npm's Windows shim is a .cmd file. Run its JS entrypoint via Node
+        # instead of relying on CreateProcess/.cmd argument quoting.
+        entrypoint = Path(shim).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        node = find_executable("node.exe", [Path(program_files) / "nodejs" / "node.exe"])
+        if entrypoint.is_file() and node:
+            return git, [node, str(entrypoint)]
+        raise FileNotFoundError("Codex npm 실행 파일은 발견했지만 Node.js 또는 codex.js를 찾지 못했습니다. npm install -g @openai/codex 로 재설치하세요.")
+    codex = find_executable("codex")
+    if codex and Path(codex).suffix.lower() not in (".cmd", ".bat"):
+        return git, [codex]
+    raise FileNotFoundError("Codex CLI 실행 파일을 찾을 수 없습니다. npm install -g @openai/codex 후 Nora Studio를 재시작하세요.")
+
+
 def progress_update(task_id, value, step, log=None):
     """Report verified workflow milestones; never estimate AI code completion."""
     stamp = now()
@@ -202,9 +247,9 @@ def criteria_list(acceptance):
     return lines[:30]
 
 
-def inspect_code_progress(task_id, cwd):
+def inspect_code_progress(task_id, cwd, git="git"):
     """Verify an AI-reported criterion only when its evidence file changed in Git."""
-    result = command(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd, 8)
+    result = command([git, "status", "--porcelain", "-z", "--untracked-files=all"], cwd, 8)
     if result.returncode:
         return
     filenames = []
@@ -252,10 +297,14 @@ def inspect_code_progress(task_id, cwd):
                    int(reported and evidence_changed), stamp, int(evidence_changed), stamp, task_id))
 
 
-def stream_codex(task_id, args, cwd):
+def stream_codex(task_id, args, cwd, prompt=None, git="git"):
     """Stream merged CLI output safely without blocking the API event loop."""
-    proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, errors="replace", bufsize=1)
+    if prompt is not None:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
     lines = queue.Queue()
     def read_output():
         for line in proc.stdout:
@@ -283,13 +332,13 @@ def stream_codex(task_id, args, cwd):
             except queue.Empty:
                 pass
             if time.monotonic() - last_flush > 2:
-                inspect_code_progress(task_id, cwd)
+                inspect_code_progress(task_id, cwd, git)
                 if dirty:
                     progress_update(task_id, 35, "Codex 코드 작업 중", output)
                 last_flush = time.monotonic()
                 dirty = False
         proc.wait(timeout=5)
-        inspect_code_progress(task_id, cwd)
+        inspect_code_progress(task_id, cwd, git)
         return proc.returncode, output
     finally:
         if proc.poll() is None:
@@ -310,7 +359,8 @@ def do_work(task_id):
     if not repo.is_dir() or not (repo / ".git").exists():
         return "failed", "NORA_REPO or project repo_path must point to a Git working tree"
     try:
-        state = command(["git", "status", "--porcelain"], repo)
+        git, codex = tool_commands()
+        state = command([git, "status", "--porcelain"], repo)
         if state.returncode or state.stdout.strip():
             return "failed", "Git worktree is not clean; preserve existing changes before running"
         branch = f"ai/nora-{task_id}-{int(time.time())}"
@@ -318,7 +368,7 @@ def do_work(task_id):
         worktrees = DATA / "worktrees"
         worktrees.mkdir(parents=True, exist_ok=True)
         target = worktrees / f"task-{task_id}-{int(time.time())}"
-        created = command(["git", "worktree", "add", "-b", branch, str(target), "HEAD"], repo, 60)
+        created = command([git, "worktree", "add", "-b", branch, str(target), "HEAD"], repo, 60)
         if created.returncode:
             return "failed", created.stderr[-5000:]
         with connect() as c:
@@ -340,7 +390,7 @@ def do_work(task_id):
             f"Acceptance criteria: {task['acceptance']}\n"
         )
         # Non-interactive Codex. Always isolated to a task-specific worktree.
-        exit_code, output = stream_codex(task_id, ["codex", "exec", "--sandbox", "workspace-write", prompt], target)
+        exit_code, output = stream_codex(task_id, codex + ["exec", "--sandbox", "workspace-write", "-"], target, prompt=prompt, git=git)
         status = "review" if exit_code == 0 else "failed"
         return status, f"Worktree: {target}\nBranch: {branch}\nExit: {exit_code}\n{output}"
     except FileNotFoundError as exc:
