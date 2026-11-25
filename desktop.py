@@ -39,7 +39,7 @@ def config():
         else:
             path.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
     settings = json.loads(path.read_text(encoding="utf-8-sig"))
-    if "releaseRepo" not in settings:
+    if settings.get("releaseRepo") in (None, "", "KimNora07/NoraStudio"):
         settings["releaseRepo"] = "KimNora07/NoraClient"
         path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     port = int(settings.get("port", 8765))
