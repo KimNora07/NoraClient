@@ -14,11 +14,11 @@ if errorlevel 1 goto fail
 if errorlevel 1 goto fail
 ".build-venv\Scripts\python.exe" windows\Generate-App-Icon.py
 if errorlevel 1 goto fail
-".build-venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --name NoraStudio --icon "assets\NoraStudio.ico" --add-data "static;static" --collect-all uvicorn --collect-all PySide6.QtWebEngineCore --collect-all PySide6.QtWebEngineWidgets --hidden-import uvicorn.logging desktop.py
+".build-venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --windowed --name NoraStudio --icon "assets\NoraStudio.ico" --add-data "static;static" --collect-all uvicorn --collect-all PySide6.QtWebEngineCore --collect-all PySide6.QtWebEngineWidgets --collect-submodules keyring.backends --hidden-import uvicorn.logging desktop.py
 if errorlevel 1 goto fail
 echo.
-echo SUCCESS: dist\NoraStudio.exe
-echo The EXE is portable, but Ollama and Codex remain separate optional dependencies.
+echo SUCCESS: dist\NoraStudio\NoraStudio.exe
+echo The EXE and _internal folder must remain together.
 if /I not "%~1"=="--no-pause" pause
 exit /b 0
 :fail

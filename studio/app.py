@@ -16,8 +16,8 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from studio import updater
+from pydantic import BaseModel, Field, SecretStr
+from studio import updater, github_auth
 
 BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 DATA = Path(os.environ.get("NORA_DATA", str(BASE / "data"))).resolve()
@@ -161,6 +161,10 @@ class FeatureSubmit(BaseModel):
 class FeatureReview(BaseModel):
     decision: str = Field(pattern="^(accept|reject)$")
     note: str = Field(default="", max_length=2000)
+
+
+class GitHubCredentialInput(BaseModel):
+    token: SecretStr = Field(min_length=20, max_length=500, repr=False)
 
 
 class AgentInput(BaseModel):
@@ -420,8 +424,11 @@ def sync_github(project_id: int):
     if not row: raise HTTPException(404,"Project not found")
     repo = validate_github_repo(row["github_repo"])
     if not repo: raise HTTPException(409,"프로젝트에 GitHub 저장소를 설정하세요")
-    headers = {"Accept":"application/vnd.github+json","User-Agent":"NoraStudio/0.5.0"}
-    github_token = os.environ.get("NORA_GITHUB_TOKEN")
+    headers = {"Accept":"application/vnd.github+json","User-Agent":"NoraStudio/0.5.1"}
+    try:
+        github_token = github_auth.get_token()
+    except RuntimeError as exc:
+        raise HTTPException(503,str(exc)) from exc
     if github_token: headers["Authorization"] = f"Bearer {github_token}"
     try:
         with httpx.Client(timeout=15, follow_redirects=False) as client:
@@ -430,6 +437,12 @@ def sync_github(project_id: int):
             response.raise_for_status()
             items = response.json()
         if not isinstance(items,list): raise ValueError("GitHub returned invalid commit data")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(502,"저장소를 찾을 수 없습니다. Private 저장소라면 회사 설정에서 읽기 전용 GitHub 토큰을 연결하세요.") from exc
+        if exc.response.status_code in (401,403):
+            raise HTTPException(502,"GitHub 인증 또는 접근 권한이 없습니다. 선택한 저장소의 Contents 읽기 권한을 확인하세요.") from exc
+        raise HTTPException(502,f"GitHub API 오류: HTTP {exc.response.status_code}") from exc
     except (httpx.HTTPError,ValueError) as exc:
         raise HTTPException(502,f"GitHub 커밋 조회 실패: {exc}") from exc
     count = 0
@@ -455,6 +468,43 @@ def github_activity(project_id: int | None = None):
         return [dict(r) for r in c.execute("""SELECT * FROM github_commits
             WHERE (? IS NULL OR project_id=?) ORDER BY committed_at DESC LIMIT 100""",
             (project_id,project_id))]
+
+
+@app.get("/api/github/credentials", dependencies=[Depends(auth)])
+def github_credential_status():
+    try:
+        source = github_auth.token_source()
+    except RuntimeError as exc:
+        raise HTTPException(503,str(exc)) from exc
+    return {"configured":source!="none", "source":source}
+
+
+@app.post("/api/github/credentials", dependencies=[Depends(auth)])
+def configure_github_credentials(payload: GitHubCredentialInput):
+    token = payload.token.get_secret_value()
+    try:
+        with httpx.Client(timeout=12,follow_redirects=False) as client:
+            result = client.get("https://api.github.com/user",headers={
+                "Accept":"application/vnd.github+json","User-Agent":"NoraStudio/0.5.1",
+                "Authorization":f"Bearer {token}"})
+            result.raise_for_status()
+        github_auth.set_token(token)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(422,"GitHub 토큰 인증에 실패했습니다. 토큰과 만료 여부를 확인하세요.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502,f"GitHub 연결 확인 실패: {type(exc).__name__}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(503,str(exc)) from exc
+    return {"configured":True,"source":"windows"}
+
+
+@app.delete("/api/github/credentials", dependencies=[Depends(auth)])
+def delete_github_credentials():
+    try:
+        github_auth.clear_token()
+        return {"configured":github_auth.token_source()!="none"}
+    except RuntimeError as exc:
+        raise HTTPException(503,str(exc)) from exc
 
 
 @app.get("/api/agents")

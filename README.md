@@ -1,4 +1,12 @@
-# Nora Studio v0.5.0 — 1인 게임 스튜디오 경영 시스템
+# Nora Studio v0.5.1 — 안정적인 설치 및 Private GitHub 동기화
+
+## v0.5.1 변경 사항
+
+- PyInstaller `--onefile`을 `--onedir`로 전환했습니다. EXE와 `_internal` 폴더를 Inno Setup이 함께 설치하므로 실행 시 임시 `_MEI` 폴더에 Python DLL을 풀지 않습니다.
+- 자동 업데이트 보조 프로그램은 기존 `NoraStudio.exe` 프로세스가 모두 종료되었는지 최대 90초 확인하고, 설치 종료 코드 0을 확인한 뒤 3초 대기하여 앱을 시작합니다. 실패하면 자동 재실행하지 않고 `updates/update-install.log`를 남깁니다.
+- **Private 저장소 동기화:** GitHub fine-grained Personal Access Token을 설정 → GitHub 연결에서 등록하세요. 대상 저장소를 선택하고 Repository permissions의 **Contents: Read-only** 권한을 부여합니다.
+- 토큰은 Windows Credential Manager에 저장합니다. SQLite나 `config.json`에 저장하지 않습니다. 다른 OS의 개발 환경은 `NORA_GITHUB_TOKEN` 환경 변수를 사용할 수 있습니다.
+- GitHub 동기화는 여전히 커밋 조회 전용이며, 코드 쓰기·푸시·병합 권한이 필요하지 않습니다.
 
 Unity/C# 프로젝트를 Codex 앱에서 직접 개발하고, Nora Studio에서는 **프로젝트 경영·마일스톤·GitHub 개발 활동·기능 검수**를 관리합니다.
 
@@ -15,7 +23,7 @@ Unity/C# 프로젝트를 Codex 앱에서 직접 개발하고, Nora Studio에서�
 
 ### 설치형 Windows 앱
 
-GitHub Releases의 `NoraStudio-Setup-0.5.0.exe`를 설치합니다(릴리스 빌드 후 제공).
+GitHub Releases의 `NoraStudio-Setup-0.5.1.exe`를 설치합니다(릴리스 빌드 후 제공).
 앱 실행 시 `config.json`의 `noraToken`으로 관리자 접속할 수 있으며, 토큰 없이 게스트 조회도 가능합니다.
 
 ### Python 개발 실행
@@ -34,7 +42,7 @@ $env:NORA_TOKEN = "여기에-안전한-관리자-토큰"
 ### 설치 파일 직접 빌드
 
 Windows에서 Python 3.12, Inno Setup 6을 설치한 후 `windows\Build-Installer.bat` 실행.
-성공 시 `installer-output\NoraStudio-Setup-0.5.0.exe` 생성.
+성공 시 `installer-output\NoraStudio-Setup-0.5.1.exe` 생성.
 
 ## 업무 흐름
 
@@ -64,7 +72,9 @@ Windows에서 Python 3.12, Inno Setup 6을 설치한 후 `windows\Build-Installe
 
 - 형식: `KimNora07/NoraClient` 또는 `https://github.com/KimNora07/NoraClient`
 - GitHub REST API를 사용하며 공개 저장소는 별도 토큰 없이 조회 가능
-- 선택: `NORA_GITHUB_TOKEN` 환경 변수를 설정하면 등록된 토큰으로 조회(비공개 저장소 지원을 보장하지 않음)
+- Private 저장소는 회사 설정에서 GitHub fine-grained PAT을 등록하세요. 본인 계정에서 접근 가능한 저장소를 선택하고 `Contents: Read-only`를 부여합니다.
+- 토큰은 Windows Credential Manager에 별도로 보관되며 화면이나 API 응답에 값이 노출되지 않습니다.
+- 선택: `NORA_GITHUB_TOKEN` 환경 변수가 있으면 Windows 저장소의 토큰보다 우선 적용됩니다.
 - API 장애, 레이트 제한, 네트워크 오류는 사용자에게 표시하며 기존 SQLite 데이터는 유지
 - 커밋이 없더라도 기능이 자동 반려되지 않고, 커밋이 많더라도 자동 검수되지 않음
 

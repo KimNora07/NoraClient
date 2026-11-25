@@ -99,6 +99,35 @@ def test_github_sync_deduplicates_and_does_not_mark_verified(tmp_path, monkeypat
         c.__exit__(None, None, None)
 
 
+def test_private_github_credentials_are_not_stored_in_sqlite(tmp_path, monkeypatch):
+    m, c, h = make_client(tmp_path, monkeypatch)
+    saved = []
+    secret = "github_pat_private_test_123456789"
+    try:
+        p = c.post("/api/projects",headers=h,json={"name":"Private Project","github_repo":"Nora/private-game"}).json()
+        monkeypatch.setattr(m.github_auth,"set_token",lambda value:saved.append(value))
+        monkeypatch.setattr(m.github_auth,"get_token",lambda:saved[-1] if saved else None)
+        monkeypatch.setattr(m.github_auth,"token_source",lambda:"windows" if saved else "none")
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self): return []
+        class FakeClient:
+            def __init__(self,**kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self,*args): pass
+            def get(self,url,**kwargs):
+                assert kwargs["headers"].get("Authorization")==f"Bearer {secret}"
+                return FakeResponse()
+        monkeypatch.setattr(m.httpx,"Client",FakeClient)
+        assert c.post("/api/github/credentials",json={"token":secret}).status_code==401
+        assert c.post("/api/github/credentials",headers=h,json={"token":secret}).json()["configured"]
+        assert c.get("/api/github/credentials",headers=h).json()=={"configured":True,"source":"windows"}
+        assert c.post(f"/api/projects/{p['id']}/github/sync",headers=h).status_code==200
+        assert secret not in (tmp_path/"studio.sqlite3").read_bytes().decode("latin1",errors="ignore")
+    finally:
+        c.__exit__(None,None,None)
+
+
 def test_migrate_v01_sqlite_without_removing_existing_tables(tmp_path, monkeypatch):
     with sqlite3.connect(tmp_path/"studio.sqlite3") as db:
         db.execute("""CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,

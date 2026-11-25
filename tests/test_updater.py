@@ -10,16 +10,16 @@ from studio import updater
 def test_release_requires_git_hub_asset_digest(monkeypatch):
     binary = b"signed-by-release-digest"
     digest = hashlib.sha256(binary).hexdigest()
-    release = {"tag_name": "v0.5.1", "body": "Patch notes", "assets": [{
-        "name": "NoraStudio-Setup-0.5.1.exe", "digest": f"sha256:{digest}",
-        "browser_download_url": "https://github.com/nora-dev/nora-studio/releases/download/v0.5.1/NoraStudio-Setup-0.5.1.exe",
+    release = {"tag_name": "v0.5.2", "body": "Patch notes", "assets": [{
+        "name": "NoraStudio-Setup-0.5.2.exe", "digest": f"sha256:{digest}",
+        "browser_download_url": "https://github.com/nora-dev/nora-studio/releases/download/v0.5.2/NoraStudio-Setup-0.5.2.exe",
         "size": len(binary),
     }]}
     monkeypatch.setattr(updater.urllib.request, "urlopen", lambda *a, **kw: io.BytesIO(json.dumps(release).encode()))
     info = updater.latest_release("nora-dev/nora-studio")
     assert info["available"] is True
     assert info["digest"] == digest
-    assert updater.latest_release("https://github.com/nora-dev/nora-studio")["latest"] == "v0.5.1"
+    assert updater.latest_release("https://github.com/nora-dev/nora-studio")["latest"] == "v0.5.2"
     with pytest.raises(ValueError):
         updater.normalize_repo("https://evil.example/nora-dev/nora-studio")
 
@@ -35,3 +35,11 @@ def test_download_verifies_exact_digest(tmp_path, monkeypatch):
     bad = dict(release, digest="0" * 64)
     with pytest.raises(ValueError, match="무결성"):
         updater.download_release(bad, tmp_path)
+
+
+def test_updater_waits_for_all_app_processes(tmp_path):
+    helper = updater.make_helper(tmp_path)
+    content = helper.read_text(encoding="utf-8")
+    assert "Get-CimInstance Win32_Process" in content
+    assert "Installer exit code" in content
+    assert "Start-Sleep -Seconds 3" in content

@@ -1,7 +1,7 @@
 ; Nora Studio per-user Windows installer wizard (Inno Setup 6).
 ; Database/configuration live in %LOCALAPPDATA%\NoraStudio, outside {app}.
 #define AppName "Nora Studio"
-#define AppVersion "0.5.0"
+#define AppVersion "0.5.1"
 #define AppExe "NoraStudio.exe"
 
 [Setup]
@@ -31,7 +31,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\dist\NoraStudio.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\NoraStudio\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\Nora Studio"; Filename: "{app}\NoraStudio.exe"; WorkingDir: "{app}"

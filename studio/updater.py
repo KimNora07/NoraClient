@@ -6,7 +6,7 @@ import re
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 MAX_DOWNLOAD_BYTES = 850 * 1024 * 1024
@@ -118,16 +118,35 @@ def consume_install_request():
 
 
 def make_helper(folder):
-    """PowerShell helper waits for app exit, installs, then relaunches the app."""
+    """Separate helper waits for every installed app process before replacing files."""
     helper = Path(folder) / "apply-update.ps1"
     helper.write_text('''param([int]$ParentProcessId, [string]$InstallerPath, [string]$AppPath)
-$limit = (Get-Date).AddSeconds(45)
-while ((Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $limit)) {
-    Start-Sleep -Milliseconds 350
+$ErrorActionPreference = 'Stop'
+$log = Join-Path (Split-Path -Parent $InstallerPath) 'update-install.log'
+function Log([string]$message) { Add-Content -LiteralPath $log -Encoding UTF8 -Value "$(Get-Date -Format o) $message" }
+try {
+    Log 'Waiting for Nora Studio processes to exit'
+    $limit = (Get-Date).AddSeconds(90)
+    do {
+        $parent = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+        $remaining = @(Get-CimInstance Win32_Process -Filter "Name='NoraStudio.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $AppPath, [StringComparison]::OrdinalIgnoreCase) })
+        if (-not $parent -and $remaining.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $limit)
+    if ($parent -or $remaining.Count -gt 0) { Log 'App processes still running; cancelled update'; exit 3 }
+    Log 'Running verified Inno Setup installer'
+    $result = Start-Process -FilePath $InstallerPath -ArgumentList '/SILENT','/NORESTART','/CLOSEAPPLICATIONS','/SUPPRESSMSGBOXES' -PassThru -Wait
+    Log "Installer exit code: $($result.ExitCode)"
+    if ($result.ExitCode -ne 0) { exit $result.ExitCode }
+    Start-Sleep -Seconds 3
+    if (-not (Test-Path -LiteralPath $AppPath)) { Log 'Updated EXE missing'; exit 4 }
+    Start-Process -FilePath $AppPath -WorkingDirectory (Split-Path -Parent $AppPath)
+    Log 'Updated app launch requested'
+    exit 0
+} catch {
+    Log "Update failed: $($_.Exception.Message)"
+    exit 5
 }
-if (Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue) { exit 3 }
-$result = Start-Process -FilePath $InstallerPath -ArgumentList '/SILENT','/NORESTART','/CLOSEAPPLICATIONS' -PassThru -Wait
-if ($result.ExitCode -eq 0) { Start-Process -FilePath $AppPath }
-exit $result.ExitCode
 ''', encoding="utf-8")
     return helper
