@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,10 +26,12 @@ jobs:
       - name: Verify release tag matches version
         shell: pwsh
         run: |
-          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
           $iss = Get-Content 'windows/NoraStudio.iss' -Raw
-          if ($iss -notmatch [regex]::Escape('#define AppVersion "' + $tagVersion + '"')) {
-            throw 'Release tag does not match windows/NoraStudio.iss AppVersion.'
+          if ($iss -notmatch '#define AppVersion "(\d+\.\d+\.\d+)"') {
+            throw 'Cannot determine version in windows/NoraStudio.iss.'
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$($Matches[1])") {
+            throw 'Release tag does not match AppVersion.'
           }
 
       - name: Build EXE and installer
@@ -41,7 +43,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $iss = Get-Content 'windows/NoraStudio.iss' -Raw
+          if ($iss -notmatch '#define AppVersion "(\d+\.\d+\.\d+)"') { throw 'Missing app version.' }
+          $version = $Matches[1]
+          $tag = "v$version"
           $asset = "installer-output/NoraStudio-Setup-$version.exe"
           if (-not (Test-Path $asset)) { throw "Installer not found: $asset" }
-          gh release create '${{ github.ref_name }}' $asset --title "Nora Studio $version" --generate-notes
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --target $env:GITHUB_SHA --title "Nora Studio $version" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }
