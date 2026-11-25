@@ -3,27 +3,21 @@
 Run with: uvicorn studio.app:app --host 127.0.0.1 --port 8765
 """
 
-import asyncio
-import json
 import os
-import queue
+import re
 import secrets
-import shutil
 import sqlite3
-import subprocess
 import sys
-import time
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from studio import updater
-from studio.codex_server import AppServerSession, AppServerError
 
 BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 DATA = Path(os.environ.get("NORA_DATA", str(BASE / "data"))).resolve()
@@ -31,17 +25,9 @@ DB = DATA / "studio.sqlite3"
 REPO = Path(os.environ.get("NORA_REPO", "")).expanduser()
 TOKEN = os.environ.get("NORA_TOKEN", "")
 MODEL = os.environ.get("NORA_MODEL", "qwen3:8b")
-OLLAMA = os.environ.get("NORA_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-CODEX_ENABLED = os.environ.get("NORA_CODEX_ENABLED", "0") == "1"
-AUTO_RUN = os.environ.get("NORA_AUTO_RUN", "0") == "1"
-MAX_RUNTIME = int(os.environ.get("NORA_CODEX_TIMEOUT", "1200"))
 RELEASE_REPO = os.environ.get("NORA_RELEASE_REPO", "")
 UPDATE_DIR = DATA.parent / "updates"
 _ready_update = None
-lock = asyncio.Lock()
-active_sessions = {}
-sessions_lock = threading.Lock()
-stop_requests = set()
 
 
 def now():
@@ -77,6 +63,28 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL,
             message TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+            title TEXT NOT NULL, due_date TEXT, status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES projects(id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS features (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+            milestone_id INTEGER, title TEXT NOT NULL, criteria TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned', evidence_url TEXT NOT NULL DEFAULT '',
+            review_note TEXT NOT NULL DEFAULT '', reviewed_at TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS feature_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, feature_id INTEGER NOT NULL,
+            decision TEXT NOT NULL, note TEXT NOT NULL, evidence_url TEXT NOT NULL,
+            decided_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS github_commits (
+            project_id INTEGER NOT NULL, sha TEXT NOT NULL, message TEXT NOT NULL,
+            author TEXT NOT NULL, committed_at TEXT, url TEXT NOT NULL,
+            PRIMARY KEY(project_id, sha))""")
+        existing_projects = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
+        if "github_repo" not in existing_projects:
+            c.execute("ALTER TABLE projects ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''")
         existing = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
         for col, definition in [("project_id", "INTEGER"), ("agent_id", "INTEGER"),
                                 ("priority", "TEXT NOT NULL DEFAULT 'medium'"),
@@ -120,20 +128,39 @@ def guest_or_admin(x_nora_token: str | None = Header(default=None)):
     return False
 
 
-class TaskInput(BaseModel):
-    title: str = Field(min_length=3, max_length=120)
-    description: str = Field(min_length=5, max_length=8000)
-    acceptance: str = Field(min_length=5, max_length=4000)
-    project_id: int | None = None
-    agent_id: int | None = None
-    priority: str = Field(default="medium", pattern="^(low|medium|high|critical)$")
-
-
 class ProjectInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     description: str = Field(default="", max_length=3000)
     stage: str = Field(default="prototype", pattern="^(idea|prototype|production|testing|released)$")
     repo_path: str = Field(default="", max_length=700)
+    github_repo: str = Field(default="", max_length=150)
+
+
+class MilestoneInput(BaseModel):
+    project_id: int
+    title: str = Field(min_length=2, max_length=160)
+    due_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class MilestoneStatus(BaseModel):
+    status: str = Field(pattern="^(planned|active|done)$")
+
+
+class FeatureInput(BaseModel):
+    project_id: int
+    milestone_id: int | None = None
+    title: str = Field(min_length=2, max_length=160)
+    criteria: str = Field(min_length=5, max_length=3000)
+
+
+class FeatureSubmit(BaseModel):
+    evidence_url: str = Field(min_length=6, max_length=700)
+    note: str = Field(default="", max_length=2000)
+
+
+class FeatureReview(BaseModel):
+    decision: str = Field(pattern="^(accept|reject)$")
+    note: str = Field(default="", max_length=2000)
 
 
 class AgentInput(BaseModel):
@@ -145,10 +172,6 @@ class AgentInput(BaseModel):
     enabled: bool = True
 
 
-class DecisionInput(BaseModel):
-    note: str = Field(default="", max_length=2000)
-
-
 def record(c, category, message):
     c.execute("INSERT INTO activity(category,message,created_at) VALUES(?,?,?)", (category, message, now()))
 
@@ -157,8 +180,11 @@ def exists(c, table, item_id):
     return c.execute(f"SELECT 1 FROM {table} WHERE id=?", (item_id,)).fetchone() is not None
 
 
-class PlanInput(BaseModel):
-    idea: str = Field(min_length=5, max_length=4000)
+def validate_github_repo(value):
+    raw = value.strip().removeprefix("https://github.com/").removesuffix("/")
+    if raw and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", raw):
+        raise HTTPException(422, "GitHub 저장소는 owner/repository 형식으로 입력하세요")
+    return raw
 
 
 def get_task(task_id):
@@ -169,331 +195,11 @@ def get_task(task_id):
     return dict(row)
 
 
-def transition(task_id, before, after):
-    milestones = {"approved": (10, "대표 승인 완료 · 실행 대기"),
-                  "running": (15, "Git 환경 점검 중"),
-                  "done": (100, "최종 승인 완료"),
-                  "review": (85, "Codex 종료 · 대표 검토 대기")}
-    with connect() as c:
-        progress, step = milestones.get(after, (None, None))
-        cur = c.execute(
-            "UPDATE tasks SET status=?, progress=COALESCE(?,progress), current_step=COALESCE(?,current_step), last_activity=?, updated_at=?, approved_at=CASE WHEN ?='approved' THEN ? ELSE approved_at END WHERE id=? AND status=?",
-            (after, progress, step, now(), now(), after, now(), task_id, before),
-        )
-        if cur.rowcount != 1:
-            raise HTTPException(409, "Task state changed; refresh")
-        record(c, "task", f"#{task_id}: {before} → {after}")
-    return get_task(task_id)
-
-
-def command(args, cwd, timeout=30):
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          errors="replace", timeout=timeout, check=False)
-
-
-def find_executable(name, extra_paths=()):
-    """Resolve a tool independently of the frozen desktop app's search path."""
-    discovered = shutil.which(name)
-    if discovered:
-        return str(Path(discovered).resolve())
-    for candidate in extra_paths:
-        if candidate and Path(candidate).is_file():
-            return str(Path(candidate).resolve())
-    return None
-
-
-def tool_commands():
-    """Use absolute paths; never pass task text through a Windows batch shell."""
-    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-    local = os.environ.get("LOCALAPPDATA", "")
-    roaming = os.environ.get("APPDATA", "")
-    git = find_executable("git", [
-        Path(program_files) / "Git" / "cmd" / "git.exe",
-        Path(local) / "Programs" / "Git" / "cmd" / "git.exe" if local else None,
-    ])
-    if not git:
-        raise FileNotFoundError("Git 실행 파일을 찾을 수 없습니다. Git for Windows를 설치하고 Nora Studio를 재시작하세요.")
-
-    codex = find_executable("codex.exe")
-    if codex:
-        return git, [codex]
-    shim = find_executable("codex.cmd", [
-        Path(roaming) / "npm" / "codex.cmd" if roaming else None,
-        Path(local) / "npm" / "codex.cmd" if local else None,
-    ])
-    if shim:
-        # npm's Windows shim is a .cmd file. Run its JS entrypoint via Node
-        # instead of relying on CreateProcess/.cmd argument quoting.
-        entrypoint = Path(shim).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-        node = find_executable("node.exe", [Path(program_files) / "nodejs" / "node.exe"])
-        if entrypoint.is_file() and node:
-            return git, [node, str(entrypoint)]
-        raise FileNotFoundError("Codex npm 실행 파일은 발견했지만 Node.js 또는 codex.js를 찾지 못했습니다. npm install -g @openai/codex 로 재설치하세요.")
-    codex = find_executable("codex")
-    if codex and Path(codex).suffix.lower() not in (".cmd", ".bat"):
-        return git, [codex]
-    raise FileNotFoundError("Codex CLI 실행 파일을 찾을 수 없습니다. npm install -g @openai/codex 후 Nora Studio를 재시작하세요.")
-
-
-def progress_update(task_id, value, step, log=None):
-    """Report verified workflow milestones; never estimate AI code completion."""
-    stamp = now()
-    with connect() as c:
-        if log is None:
-            c.execute("UPDATE tasks SET progress=?,current_step=?,last_activity=?,updated_at=? WHERE id=? AND status='running'",
-                      (value, step, stamp, stamp, task_id))
-        else:
-            c.execute("UPDATE tasks SET progress=?,current_step=?,last_activity=?,updated_at=?,log=? WHERE id=? AND status='running'",
-                      (value, step, stamp, stamp, log[-32000:], task_id))
-
-
-def criteria_list(acceptance):
-    """One nonblank completion criterion per line; no invented substeps."""
-    lines = [line.strip().lstrip("-• ") for line in acceptance.splitlines() if line.strip()]
-    return lines[:30]
-
-
-def inspect_code_progress(task_id, cwd, git="git"):
-    """Verify an AI-reported criterion only when its evidence file changed in Git."""
-    result = command([git, "status", "--porcelain", "-z", "--untracked-files=all"], cwd, 8)
-    if result.returncode:
-        return
-    filenames = []
-    entries = result.stdout.split("\0")
-    i = 0
-    while i < len(entries) and entries[i]:
-        entry = entries[i]
-        if len(entry) < 4:
-            break
-        filenames.append(entry[3:])
-        i += 2 if entry[0] in "RC" or entry[1] in "RC" else 1
-    changed = sorted(set(name for name in filenames if name != ".nora-progress.json"))[:100]
-    task = get_task(task_id)
-    criteria = criteria_list(task["acceptance"])
-    completed = 0
-    report_path = cwd / ".nora-progress.json"
-    reported = False
-    if report_path.is_file() and report_path.stat().st_size <= 32768:
-        try:
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            items = report.get("items", [])
-            if isinstance(items, list) and len(items) == len(criteria):
-                for criterion, item in zip(criteria, items):
-                    if not isinstance(item, dict) or item.get("title") != criterion:
-                        continue
-                    evidence = item.get("evidence")
-                    if not item.get("done") or not isinstance(evidence, str) or evidence not in changed:
-                        continue
-                    candidate = (cwd / evidence).resolve()
-                    if candidate.is_relative_to(cwd.resolve()) and candidate.is_file():
-                        completed += 1
-                reported = True
-        except (OSError, ValueError, TypeError):
-            pass
-    percent = round(completed / len(criteria) * 100) if reported and criteria else None
-    stamp = now()
-    changed_json = json.dumps(changed, ensure_ascii=False)
-    evidence_changed = changed_json != (task.get("changed_files") or "[]") or percent != task.get("code_percent")
-    with connect() as c:
-        c.execute("""UPDATE tasks SET code_percent=?, code_completed=?,code_total=?,
-                     changed_files=?,code_reported_at=CASE WHEN ? THEN ? ELSE code_reported_at END,
-                     last_activity=CASE WHEN ? THEN ? ELSE last_activity END
-                     WHERE id=? AND status='running'""",
-                  (percent, completed, len(criteria), changed_json,
-                   int(reported and evidence_changed), stamp, int(evidence_changed), stamp, task_id))
-
-
-def stream_codex(task_id, args, cwd, prompt=None, git="git"):
-    """Stream merged CLI output safely without blocking the API event loop."""
-    proc = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding="utf-8", errors="replace", bufsize=1)
-    if prompt is not None:
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-    lines = queue.Queue()
-    def read_output():
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)
-    reader = threading.Thread(target=read_output, daemon=True)
-    reader.start()
-    output = ""
-    started = time.monotonic()
-    last_flush = 0
-    finished = False
-    dirty = False
-    progress_update(task_id, 35, "Codex 프로세스 실행 중 · 완료율 미확인")
-    try:
-        while not finished:
-            if time.monotonic() - started > MAX_RUNTIME:
-                raise subprocess.TimeoutExpired(args, MAX_RUNTIME)
-            try:
-                line = lines.get(timeout=0.5)
-                if line is None:
-                    finished = True
-                else:
-                    output = (output + line)[-32000:]
-                    dirty = True
-            except queue.Empty:
-                pass
-            if time.monotonic() - last_flush > 2:
-                inspect_code_progress(task_id, cwd, git)
-                if dirty:
-                    progress_update(task_id, 35, "Codex 코드 작업 중", output)
-                last_flush = time.monotonic()
-                dirty = False
-        proc.wait(timeout=5)
-        inspect_code_progress(task_id, cwd, git)
-        return proc.returncode, output
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-
-
-def stream_app_server(task_id, codex, cwd, prompt, git):
-    """Run a single approved turn and persist real-time event text in SQLite."""
-    output = []
-    last_check = [0.0]
-
-    def on_event(event):
-        method = event.get("method", "")
-        params = event.get("params") or {}
-        delta = params.get("delta")
-        if method in ("item/agentMessage/delta", "item/plan/delta",
-                      "item/commandExecution/outputDelta", "item/fileChange/outputDelta"):
-            if isinstance(delta, str):
-                output.append(delta)
-        elif method == "item/started":
-            item = params.get("item") or {}
-            output.append(f"\n[{item.get('type', 'item')}] {str(item.get('command') or item.get('id') or '')[:180]}\n")
-        elif method == "turn/completed":
-            output.append(f"\n[turn] {params.get('turn', {}).get('status', 'unknown')}\n")
-        if len(output) > 1000:
-            output[:] = ["".join(output)[-24000:]]
-        stamp = time.monotonic()
-        if stamp - last_check[0] >= 1 or method == "turn/completed":
-            progress_update(task_id, 35, "Codex App Server 개발 중 · 완료율 검증 대기", "".join(output)[-32000:])
-            inspect_code_progress(task_id, cwd, git)
-            last_check[0] = stamp
-
-    session = AppServerSession(codex, cwd, on_event)
-    with sessions_lock:
-        active_sessions[task_id] = session
-    try:
-        thread_id, turn_id = session.start(prompt, cwd)
-        with connect() as c:
-            c.execute("UPDATE tasks SET codex_thread_id=?,codex_turn_id=? WHERE id=?",
-                      (thread_id, turn_id, task_id))
-        progress_update(task_id, 35, "Codex App Server 실행 중")
-        with sessions_lock:
-            stopping = task_id in stop_requests
-        if stopping:
-            session.interrupt()
-        result = session.wait(MAX_RUNTIME, stop_requested=lambda: task_id in stop_requests)
-        inspect_code_progress(task_id, cwd, git)
-        return result, "".join(output)[-32000:]
-    finally:
-        session.close()
-        with sessions_lock:
-            active_sessions.pop(task_id, None)
-            stop_requests.discard(task_id)
-
-
-def do_work(task_id):
-    task = get_task(task_id)
-    if not CODEX_ENABLED:
-        return "disabled", "Codex is disabled: set NORA_CODEX_ENABLED=1"
-    with connect() as c:
-        project = c.execute("SELECT repo_path FROM projects WHERE id=?", (task.get("project_id"),)).fetchone()
-        agent = c.execute("SELECT provider,enabled FROM agents WHERE id=?", (task.get("agent_id"),)).fetchone()
-    if agent is not None and (agent["provider"] != "codex" or not agent["enabled"]):
-        return "failed", "Execution requires an enabled Codex agent"
-    repo = Path(project["repo_path"]).expanduser() if project and project["repo_path"] else REPO
-    if not repo.is_dir() or not (repo / ".git").exists():
-        return "failed", "NORA_REPO or project repo_path must point to a Git working tree"
-    try:
-        git, codex = tool_commands()
-        state = command([git, "status", "--porcelain"], repo)
-        if state.returncode or state.stdout.strip():
-            return "failed", "Git worktree is not clean; preserve existing changes before running"
-        branch = f"ai/nora-{task_id}-{int(time.time())}"
-        # Do not change the user's currently checked-out branch: create a separate worktree.
-        worktrees = DATA / "worktrees"
-        worktrees.mkdir(parents=True, exist_ok=True)
-        target = worktrees / f"task-{task_id}-{int(time.time())}"
-        created = command([git, "worktree", "add", "-b", branch, str(target), "HEAD"], repo, 60)
-        if created.returncode:
-            return "failed", created.stderr[-5000:]
-        with connect() as c:
-            c.execute("UPDATE tasks SET branch=?,attempt=attempt+1,codex_thread_id=NULL,codex_turn_id=NULL WHERE id=?", (branch, task_id))
-        progress_update(task_id, 25, "격리된 Git 작업 공간 준비 완료")
-        prompt = (
-            "You are a Unity C# developer. Perform ONLY this approved task. "
-            "Read AGENTS.md if present. Do not push, merge, deploy, delete assets, "
-            "or modify unrelated files. Do not modify Unity scenes or prefabs. "
-            "Report tests actually run, otherwise state 'not run'.\n\n"
-            "For progress reporting, maintain .nora-progress.json in the worktree. "
-            "Its schema is {\"items\": [{\"title\": exact acceptance criterion, "
-            "\"done\": true/false, \"evidence\": relative path to a file you changed}]}. "
-            "Use exactly the acceptance criteria below in order, one nonempty line per item. "
-            "Only mark done after implementation and cite a real modified file. "
-            "Update this file during the task, not only at the end. "
-            "This is self-reported progress; final review is performed by the owner.\n\n"
-            f"Title: {task['title']}\nRequirements: {task['description']}\n"
-            f"Acceptance criteria: {task['acceptance']}\n"
-        )
-        # Every attempt starts a new isolated worktree. Preserve old attempts.
-        result, output = stream_app_server(task_id, codex, target, prompt, git)
-        status = "review" if result == "completed" else "interrupted" if result == "interrupted" else "failed"
-        return status, f"Worktree: {target}\nBranch: {branch}\nCodex turn: {result}\n{output}"
-    except FileNotFoundError as exc:
-        return "failed", f"Required executable unavailable: {exc}"
-    except subprocess.TimeoutExpired:
-        return "interrupted", "Codex timed out. Inspect its worktree before retrying."
-    except Exception as exc:
-        return "failed", f"Execution error: {type(exc).__name__}: {exc}"
-
-
-async def run_next():
-    if lock.locked():
-        return
-    async with lock:
-        with connect() as c:
-            row = c.execute("SELECT id FROM tasks WHERE status='approved' ORDER BY id LIMIT 1").fetchone()
-        if not row:
-            return
-        task_id = row["id"]
-        transition(task_id, "approved", "running")
-        status, log = await asyncio.to_thread(do_work, task_id)
-        with connect() as c:
-            next_progress = 85 if status == "review" else 35
-            next_step = "Codex 종료 · 대표 검토 대기" if status == "review" else "실행 종료 · 오류/중단 확인"
-            c.execute("UPDATE tasks SET status=?, log=?, progress=?,current_step=?,last_activity=?,updated_at=? WHERE id=? AND status='running'",
-                      (status, log, next_progress, next_step, now(), now(), task_id))
-            record(c, "execution", f"#{task_id}: {status}")
-
-
-async def worker_loop():
-    while True:
-        if AUTO_RUN and CODEX_ENABLED:
-            await run_next()
-        await asyncio.sleep(5)
-
-
 @asynccontextmanager
 async def lifespan(_):
+    # Legacy SQLite data is preserved; no agent subprocesses run at startup.
     init_db()
-    worker = asyncio.create_task(worker_loop())
-    try:
-        yield
-    finally:
-        worker.cancel()
-        with sessions_lock:
-            sessions = list(active_sessions.values())
-        for session in sessions:
-            session.interrupt()
+    yield
 
 
 app = FastAPI(title="Nora Studio", lifespan=lifespan)
@@ -506,9 +212,8 @@ def index():
 
 @app.get("/api/health")
 def health(admin: bool = Depends(guest_or_admin)):
-    return {"model": MODEL, "codex_enabled": CODEX_ENABLED,
-            "auto_run": AUTO_RUN, "repo": str(REPO) if admin else "관리자 전용",
-            "role": "admin" if admin else "guest"}
+    return {"model": MODEL, "mode": "management", "codex_enabled": False,
+            "auto_run": False, "role": "admin" if admin else "guest"}
 
 
 @app.get("/api/update/check", dependencies=[Depends(auth)])
@@ -544,8 +249,6 @@ def install_update():
     global _ready_update
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
         raise HTTPException(409, "자동 설치는 Windows 설치형 Nora Studio.exe에서만 가능합니다.")
-    if lock.locked():
-        raise HTTPException(409, "Codex 업무 실행이 끝난 후 업데이트하세요.")
     if not _ready_update:
         raise HTTPException(409, "검증된 다운로드가 없습니다. 업데이트를 다시 다운로드하세요.")
     path, expected_size, expected_digest = _ready_update
@@ -564,8 +267,15 @@ def dashboard():
         projects_count = c.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         agents_count = c.execute("SELECT COUNT(*) FROM agents WHERE enabled=1").fetchone()[0]
         recent = [dict(r) for r in c.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 12")]
+        feature_counts = {r["status"]:r["total"] for r in c.execute("SELECT status,COUNT(*) total FROM features GROUP BY status")}
+        milestone_counts = {r["status"]:r["total"] for r in c.execute("SELECT status,COUNT(*) total FROM milestones GROUP BY status")}
+        commit_count = c.execute("SELECT COUNT(*) FROM github_commits").fetchone()[0]
+        overdue = c.execute("""SELECT COUNT(*) FROM milestones WHERE status!='done'
+            AND due_date IS NOT NULL AND due_date < date('now')""").fetchone()[0]
     return {"projects": projects_count, "agents": agents_count, "statuses": counts,
-            "pending_approvals": counts.get("draft", 0) + counts.get("review", 0), "recent": recent}
+            "pending_approvals": feature_counts.get("review",0), "recent": recent,
+            "features":feature_counts,"milestones":milestone_counts,
+            "github_commits":commit_count,"overdue_milestones":overdue}
 
 
 @app.get("/api/projects")
@@ -573,7 +283,9 @@ def projects(admin: bool = Depends(guest_or_admin)):
     with connect() as c:
         result = [dict(r) for r in c.execute("""SELECT p.*,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id) task_count,
-            (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status='done') done_count
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status='done') done_count,
+            (SELECT COUNT(*) FROM features f WHERE f.project_id=p.id) feature_count,
+            (SELECT COUNT(*) FROM features f WHERE f.project_id=p.id AND f.status='verified') verified_count
             FROM projects p ORDER BY p.id DESC""")]
     if not admin:
         for p in result:
@@ -583,13 +295,166 @@ def projects(admin: bool = Depends(guest_or_admin)):
 
 @app.post("/api/projects", dependencies=[Depends(auth)])
 def create_project(payload: ProjectInput):
+    github_repo = validate_github_repo(payload.github_repo)
     with connect() as c:
-        cur = c.execute("INSERT INTO projects(name,description,stage,repo_path,created_at) VALUES(?,?,?,?,?)",
-                        (payload.name, payload.description, payload.stage, payload.repo_path, now()))
+        cur = c.execute("INSERT INTO projects(name,description,stage,repo_path,github_repo,created_at) VALUES(?,?,?,?,?,?)",
+                        (payload.name, payload.description, payload.stage, payload.repo_path, github_repo, now()))
         record(c, "project", f"프로젝트 생성: {payload.name}")
         project_id = cur.lastrowid
     with connect() as c:
         return dict(c.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+
+
+@app.patch("/api/projects/{project_id}", dependencies=[Depends(auth)])
+def update_project(project_id: int, payload: ProjectInput):
+    github_repo = validate_github_repo(payload.github_repo)
+    with connect() as c:
+        result = c.execute("""UPDATE projects SET name=?,description=?,stage=?,repo_path=?,github_repo=? WHERE id=?""",
+                           (payload.name,payload.description,payload.stage,payload.repo_path,github_repo,project_id))
+        if not result.rowcount:
+            raise HTTPException(404, "Project not found")
+        record(c,"project",f"프로젝트 설정 변경: #{project_id}")
+    return {"ok": True}
+
+
+@app.get("/api/milestones", dependencies=[Depends(guest_or_admin)])
+def milestones(project_id: int | None = None):
+    with connect() as c:
+        return [dict(r) for r in c.execute("""SELECT m.*,
+            (SELECT COUNT(*) FROM features f WHERE f.milestone_id=m.id) feature_count,
+            (SELECT COUNT(*) FROM features f WHERE f.milestone_id=m.id AND f.status='verified') verified_count
+            FROM milestones m WHERE (? IS NULL OR m.project_id=?) ORDER BY m.id DESC""",
+            (project_id,project_id))]
+
+
+@app.post("/api/milestones", dependencies=[Depends(auth)])
+def create_milestone(payload: MilestoneInput):
+    with connect() as c:
+        if not exists(c,"projects",payload.project_id):
+            raise HTTPException(422,"Unknown project")
+        cur = c.execute("INSERT INTO milestones(project_id,title,due_date,created_at) VALUES(?,?,?,?)",
+                        (payload.project_id,payload.title,payload.due_date,now()))
+        record(c,"milestone",f"마일스톤 등록: {payload.title}")
+        return {"id":cur.lastrowid,"status":"planned"}
+
+
+@app.patch("/api/milestones/{milestone_id}", dependencies=[Depends(auth)])
+def update_milestone(milestone_id: int, payload: MilestoneStatus):
+    with connect() as c:
+        if payload.status == "done":
+            total, pending = c.execute("""SELECT COUNT(*),SUM(CASE WHEN status!='verified' THEN 1 ELSE 0 END)
+                FROM features WHERE milestone_id=?""",(milestone_id,)).fetchone()
+            if not total or pending:
+                raise HTTPException(409,"완료하려면 하나 이상의 기능이 등록되고 모두 검증되어야 합니다")
+        cur = c.execute("UPDATE milestones SET status=? WHERE id=?",(payload.status,milestone_id))
+        if not cur.rowcount: raise HTTPException(404,"Milestone not found")
+        record(c,"milestone",f"마일스톤 #{milestone_id}: {payload.status}")
+    return {"ok":True}
+
+
+@app.get("/api/features", dependencies=[Depends(guest_or_admin)])
+def features(project_id: int | None = None):
+    with connect() as c:
+        return [dict(r) for r in c.execute("""SELECT * FROM features
+            WHERE (? IS NULL OR project_id=?) ORDER BY id DESC""",(project_id,project_id))]
+
+
+@app.post("/api/features", dependencies=[Depends(auth)])
+def create_feature(payload: FeatureInput):
+    with connect() as c:
+        if not exists(c,"projects",payload.project_id):
+            raise HTTPException(422,"Unknown project")
+        if payload.milestone_id is not None and not c.execute(
+            "SELECT 1 FROM milestones WHERE id=? AND project_id=?",
+            (payload.milestone_id,payload.project_id)).fetchone():
+            raise HTTPException(422,"Milestone belongs to another project")
+        cur = c.execute("""INSERT INTO features(project_id,milestone_id,title,criteria,created_at,updated_at)
+            VALUES(?,?,?,?,?,?)""",(payload.project_id,payload.milestone_id,payload.title,payload.criteria,now(),now()))
+        record(c,"feature",f"완료 조건 등록: {payload.title}")
+        return {"id":cur.lastrowid,"status":"planned"}
+
+
+@app.post("/api/features/{feature_id}/submit", dependencies=[Depends(auth)])
+def submit_feature(feature_id: int, payload: FeatureSubmit):
+    # Evidence is only a reference, not automatic proof of correctness.
+    evidence = payload.evidence_url.strip()
+    parsed = urlsplit(evidence)
+    if parsed.scheme != "https" or parsed.hostname not in ("github.com","gist.github.com") or not parsed.path.strip("/") or parsed.username or parsed.password:
+        raise HTTPException(422,"GitHub 근거 URL을 입력하세요")
+    with connect() as c:
+        cur = c.execute("""UPDATE features SET status='review',evidence_url=?,review_note=?,
+            reviewed_at=NULL,updated_at=? WHERE id=? AND status IN ('planned','rejected','verified')""",
+            (evidence,payload.note,now(),feature_id))
+        if not cur.rowcount:
+            raise HTTPException(409,"Feature not found or already awaiting review")
+        record(c,"feature",f"기능 #{feature_id}: 대표 검수 요청")
+    return {"status":"review"}
+
+
+@app.post("/api/features/{feature_id}/review", dependencies=[Depends(auth)])
+def review_feature(feature_id: int, payload: FeatureReview):
+    status = "verified" if payload.decision == "accept" else "rejected"
+    with connect() as c:
+        row = c.execute("SELECT evidence_url FROM features WHERE id=? AND status='review'",(feature_id,)).fetchone()
+        if not row: raise HTTPException(409,"Only submitted features can be reviewed")
+        if status == "rejected" and not payload.note.strip():
+            raise HTTPException(422,"반려 사유를 입력하세요")
+        c.execute("UPDATE features SET status=?,review_note=?,reviewed_at=?,updated_at=? WHERE id=?",
+                  (status,payload.note,now(),now(),feature_id))
+        c.execute("INSERT INTO feature_reviews(feature_id,decision,note,evidence_url,decided_at) VALUES(?,?,?,?,?)",
+                  (feature_id,payload.decision,payload.note,row["evidence_url"],now()))
+        record(c,"review",f"기능 #{feature_id}: {status}")
+    return {"status":status}
+
+
+@app.get("/api/feature-reviews", dependencies=[Depends(guest_or_admin)])
+def feature_reviews():
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM feature_reviews ORDER BY id DESC LIMIT 100")]
+
+
+@app.post("/api/projects/{project_id}/github/sync", dependencies=[Depends(auth)])
+def sync_github(project_id: int):
+    with connect() as c:
+        row = c.execute("SELECT github_repo FROM projects WHERE id=?",(project_id,)).fetchone()
+    if not row: raise HTTPException(404,"Project not found")
+    repo = validate_github_repo(row["github_repo"])
+    if not repo: raise HTTPException(409,"프로젝트에 GitHub 저장소를 설정하세요")
+    headers = {"Accept":"application/vnd.github+json","User-Agent":"NoraStudio/0.5.0"}
+    github_token = os.environ.get("NORA_GITHUB_TOKEN")
+    if github_token: headers["Authorization"] = f"Bearer {github_token}"
+    try:
+        with httpx.Client(timeout=15, follow_redirects=False) as client:
+            response = client.get(f"https://api.github.com/repos/{repo}/commits",
+                                  params={"per_page":30},headers=headers)
+            response.raise_for_status()
+            items = response.json()
+        if not isinstance(items,list): raise ValueError("GitHub returned invalid commit data")
+    except (httpx.HTTPError,ValueError) as exc:
+        raise HTTPException(502,f"GitHub 커밋 조회 실패: {exc}") from exc
+    count = 0
+    with connect() as c:
+        for item in items:
+            sha = item.get("sha","")
+            detail = item.get("commit") or {}
+            if not re.fullmatch(r"[0-9a-f]{40}",sha): continue
+            author = detail.get("author") or {}
+            url = f"https://github.com/{repo}/commit/{sha}"
+            cur = c.execute("""INSERT OR IGNORE INTO github_commits
+                (project_id,sha,message,author,committed_at,url) VALUES(?,?,?,?,?,?)""",
+                (project_id,sha,str(detail.get("message","")).splitlines()[0][:500],
+                 str(author.get("name") or "Unknown")[:120],author.get("date"),url))
+            count += cur.rowcount
+        record(c,"github",f"{repo}: 최근 커밋 동기화 · 새 기록 {count}개")
+    return {"fetched":len(items),"new":count}
+
+
+@app.get("/api/github-activity", dependencies=[Depends(guest_or_admin)])
+def github_activity(project_id: int | None = None):
+    with connect() as c:
+        return [dict(r) for r in c.execute("""SELECT * FROM github_commits
+            WHERE (? IS NULL OR project_id=?) ORDER BY committed_at DESC LIMIT 100""",
+            (project_id,project_id))]
 
 
 @app.get("/api/agents")
@@ -644,118 +509,5 @@ def tasks(admin: bool = Depends(guest_or_admin)):
     return result
 
 
-@app.post("/api/tasks", dependencies=[Depends(auth)])
-def create_task(payload: TaskInput):
-    with connect() as c:
-        if payload.project_id is not None and not exists(c, "projects", payload.project_id):
-            raise HTTPException(422, "Unknown project")
-        if payload.agent_id is not None and not exists(c, "agents", payload.agent_id):
-            raise HTTPException(422, "Unknown agent")
-        cur = c.execute("""INSERT INTO tasks(title,description,acceptance,project_id,agent_id,priority,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?)""", (payload.title,payload.description,payload.acceptance,
-            payload.project_id,payload.agent_id,payload.priority,now(),now()))
-        task_id = cur.lastrowid
-        record(c, "task", f"업무 초안 등록: #{task_id} {payload.title}")
-    return get_task(task_id)
 
 
-@app.post("/api/tasks/{task_id}/approve", dependencies=[Depends(auth)])
-def approve(task_id: int, decision: DecisionInput | None = None):
-    result = transition(task_id, "draft", "approved")
-    with connect() as c:
-        c.execute("INSERT INTO approvals(task_id,decision,note,decided_at) VALUES(?,?,?,?)",
-                  (task_id,"approved",decision.note if decision else "",now()))
-    return result
-
-
-@app.post("/api/tasks/{task_id}/reject", dependencies=[Depends(auth)])
-def reject(task_id: int, decision: DecisionInput | None = None):
-    result = transition(task_id, "draft", "rejected")
-    with connect() as c:
-        c.execute("INSERT INTO approvals(task_id,decision,note,decided_at) VALUES(?,?,?,?)",
-                  (task_id,"rejected",decision.note if decision else "",now()))
-    return result
-
-
-@app.post("/api/tasks/{task_id}/complete", dependencies=[Depends(auth)])
-def complete(task_id: int, decision: DecisionInput | None = None):
-    result = transition(task_id, "review", "done")
-    with connect() as c:
-        c.execute("INSERT INTO approvals(task_id,decision,note,decided_at) VALUES(?,?,?,?)",
-                  (task_id,"review_accepted",decision.note if decision else "",now()))
-    return result
-
-
-@app.post("/api/tasks/{task_id}/request-changes", dependencies=[Depends(auth)])
-def request_changes(task_id: int, decision: DecisionInput | None = None):
-    result = transition(task_id, "review", "changes_requested")
-    with connect() as c:
-        c.execute("INSERT INTO approvals(task_id,decision,note,decided_at) VALUES(?,?,?,?)",
-                  (task_id,"changes_requested",decision.note if decision else "",now()))
-    return result
-
-
-@app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(auth)])
-def retry_task(task_id: int):
-    """Explicitly request fresh owner approval, never automatically rerun failures."""
-    task = get_task(task_id)
-    if task["status"] not in ("failed", "interrupted", "changes_requested", "disabled"):
-        raise HTTPException(409, "Only stopped or failed tasks can be retried")
-    with connect() as c:
-        cur = c.execute("""UPDATE tasks SET status='draft',progress=0,
-            current_step='재시도 · 대표 승인 대기',code_percent=NULL,code_completed=0,
-            code_total=0,changed_files='[]',code_reported_at=NULL,
-            last_activity=?,updated_at=? WHERE id=? AND status=?""",
-            (now(), now(), task_id, task["status"]))
-        if not cur.rowcount:
-            raise HTTPException(409, "Task state changed; refresh")
-        record(c, "task", f"#{task_id}: 재시도 요청 · 재승인 대기")
-    return get_task(task_id)
-
-
-@app.post("/api/tasks/{task_id}/stop", dependencies=[Depends(auth)])
-def stop_task(task_id: int):
-    if get_task(task_id)["status"] != "running":
-        raise HTTPException(409, "Only running tasks can be stopped")
-    with sessions_lock:
-        stop_requests.add(task_id)
-        session = active_sessions.get(task_id)
-    if session:
-        # The worker sends turn/interrupt and retains its worktree for review.
-        threading.Thread(target=session.interrupt, daemon=True).start()
-    with connect() as c:
-        record(c, "task", f"#{task_id}: 대표가 작업 중단 요청")
-    return {"requested": True, "message": "중단 요청을 전달했습니다. 작업 종료까지 잠시 기다리세요."}
-
-
-@app.post("/api/run-next", dependencies=[Depends(auth)])
-async def run_one():
-    if not CODEX_ENABLED:
-        raise HTTPException(409, "Enable Codex explicitly first")
-    if lock.locked():
-        raise HTTPException(409, "Another task is running")
-    asyncio.create_task(run_next())
-    return {"message": "Run requested. Refresh the task list."}
-
-
-@app.post("/api/plan", dependencies=[Depends(auth)])
-async def plan(payload: PlanInput):
-    system = (
-        "You are Nora Studio's Unity game production manager. In Korean, propose "
-        "a scoped task with concise title, implementation requirements, and "
-        "testable acceptance criteria. You cannot authorize execution. "
-        "Respond ONLY as JSON with string keys title, description, acceptance."
-    )
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            result = await client.post(f"{OLLAMA}/api/chat", json={
-                "model": MODEL, "stream": False, "format": "json",
-                "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": payload.idea}],
-                "options": {"num_ctx": 4096}})
-            result.raise_for_status()
-        content = result.json()["message"]["content"]
-        proposal = TaskInput.model_validate(json.loads(content))
-        return proposal.model_dump()  # A proposal, never an approved task.
-    except (ValueError, KeyError, httpx.HTTPError) as exc:
-        raise HTTPException(502, f"Local model error: {type(exc).__name__}: {exc}") from exc
