@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from studio import updater
+from studio.codex_server import AppServerSession, AppServerError
 
 BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 DATA = Path(os.environ.get("NORA_DATA", str(BASE / "data"))).resolve()
@@ -38,6 +39,9 @@ RELEASE_REPO = os.environ.get("NORA_RELEASE_REPO", "")
 UPDATE_DIR = DATA.parent / "updates"
 _ready_update = None
 lock = asyncio.Lock()
+active_sessions = {}
+sessions_lock = threading.Lock()
+stop_requests = set()
 
 
 def now():
@@ -83,7 +87,9 @@ def init_db():
                                 ("code_completed", "INTEGER NOT NULL DEFAULT 0"),
                                 ("code_total", "INTEGER NOT NULL DEFAULT 0"),
                                 ("changed_files", "TEXT NOT NULL DEFAULT '[]'"),
-                                ("code_reported_at", "TEXT")]:
+                                ("code_reported_at", "TEXT"),
+                                ("codex_thread_id", "TEXT"), ("codex_turn_id", "TEXT"),
+                                ("attempt", "INTEGER NOT NULL DEFAULT 0")]:
             if col not in existing:
                 c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
         if c.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0:
@@ -301,7 +307,7 @@ def stream_codex(task_id, args, cwd, prompt=None, git="git"):
     """Stream merged CLI output safely without blocking the API event loop."""
     proc = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, errors="replace", bufsize=1)
+                            text=True, encoding="utf-8", errors="replace", bufsize=1)
     if prompt is not None:
         proc.stdin.write(prompt)
         proc.stdin.close()
@@ -346,6 +352,55 @@ def stream_codex(task_id, args, cwd, prompt=None, git="git"):
             proc.wait(timeout=5)
 
 
+def stream_app_server(task_id, codex, cwd, prompt, git):
+    """Run a single approved turn and persist real-time event text in SQLite."""
+    output = []
+    last_check = [0.0]
+
+    def on_event(event):
+        method = event.get("method", "")
+        params = event.get("params") or {}
+        delta = params.get("delta")
+        if method in ("item/agentMessage/delta", "item/plan/delta",
+                      "item/commandExecution/outputDelta", "item/fileChange/outputDelta"):
+            if isinstance(delta, str):
+                output.append(delta)
+        elif method == "item/started":
+            item = params.get("item") or {}
+            output.append(f"\n[{item.get('type', 'item')}] {str(item.get('command') or item.get('id') or '')[:180]}\n")
+        elif method == "turn/completed":
+            output.append(f"\n[turn] {params.get('turn', {}).get('status', 'unknown')}\n")
+        if len(output) > 1000:
+            output[:] = ["".join(output)[-24000:]]
+        stamp = time.monotonic()
+        if stamp - last_check[0] >= 1 or method == "turn/completed":
+            progress_update(task_id, 35, "Codex App Server 개발 중 · 완료율 검증 대기", "".join(output)[-32000:])
+            inspect_code_progress(task_id, cwd, git)
+            last_check[0] = stamp
+
+    session = AppServerSession(codex, cwd, on_event)
+    with sessions_lock:
+        active_sessions[task_id] = session
+    try:
+        thread_id, turn_id = session.start(prompt, cwd)
+        with connect() as c:
+            c.execute("UPDATE tasks SET codex_thread_id=?,codex_turn_id=? WHERE id=?",
+                      (thread_id, turn_id, task_id))
+        progress_update(task_id, 35, "Codex App Server 실행 중")
+        with sessions_lock:
+            stopping = task_id in stop_requests
+        if stopping:
+            session.interrupt()
+        result = session.wait(MAX_RUNTIME, stop_requested=lambda: task_id in stop_requests)
+        inspect_code_progress(task_id, cwd, git)
+        return result, "".join(output)[-32000:]
+    finally:
+        session.close()
+        with sessions_lock:
+            active_sessions.pop(task_id, None)
+            stop_requests.discard(task_id)
+
+
 def do_work(task_id):
     task = get_task(task_id)
     if not CODEX_ENABLED:
@@ -372,7 +427,7 @@ def do_work(task_id):
         if created.returncode:
             return "failed", created.stderr[-5000:]
         with connect() as c:
-            c.execute("UPDATE tasks SET branch=? WHERE id=?", (branch, task_id))
+            c.execute("UPDATE tasks SET branch=?,attempt=attempt+1,codex_thread_id=NULL,codex_turn_id=NULL WHERE id=?", (branch, task_id))
         progress_update(task_id, 25, "격리된 Git 작업 공간 준비 완료")
         prompt = (
             "You are a Unity C# developer. Perform ONLY this approved task. "
@@ -389,10 +444,10 @@ def do_work(task_id):
             f"Title: {task['title']}\nRequirements: {task['description']}\n"
             f"Acceptance criteria: {task['acceptance']}\n"
         )
-        # Non-interactive Codex. Always isolated to a task-specific worktree.
-        exit_code, output = stream_codex(task_id, codex + ["exec", "--sandbox", "workspace-write", "-"], target, prompt=prompt, git=git)
-        status = "review" if exit_code == 0 else "failed"
-        return status, f"Worktree: {target}\nBranch: {branch}\nExit: {exit_code}\n{output}"
+        # Every attempt starts a new isolated worktree. Preserve old attempts.
+        result, output = stream_app_server(task_id, codex, target, prompt, git)
+        status = "review" if result == "completed" else "interrupted" if result == "interrupted" else "failed"
+        return status, f"Worktree: {target}\nBranch: {branch}\nCodex turn: {result}\n{output}"
     except FileNotFoundError as exc:
         return "failed", f"Required executable unavailable: {exc}"
     except subprocess.TimeoutExpired:
@@ -435,6 +490,10 @@ async def lifespan(_):
         yield
     finally:
         worker.cancel()
+        with sessions_lock:
+            sessions = list(active_sessions.values())
+        for session in sessions:
+            session.interrupt()
 
 
 app = FastAPI(title="Nora Studio", lifespan=lifespan)
@@ -634,6 +693,39 @@ def request_changes(task_id: int, decision: DecisionInput | None = None):
         c.execute("INSERT INTO approvals(task_id,decision,note,decided_at) VALUES(?,?,?,?)",
                   (task_id,"changes_requested",decision.note if decision else "",now()))
     return result
+
+
+@app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(auth)])
+def retry_task(task_id: int):
+    """Explicitly request fresh owner approval, never automatically rerun failures."""
+    task = get_task(task_id)
+    if task["status"] not in ("failed", "interrupted", "changes_requested", "disabled"):
+        raise HTTPException(409, "Only stopped or failed tasks can be retried")
+    with connect() as c:
+        cur = c.execute("""UPDATE tasks SET status='draft',progress=0,
+            current_step='재시도 · 대표 승인 대기',code_percent=NULL,code_completed=0,
+            code_total=0,changed_files='[]',code_reported_at=NULL,
+            last_activity=?,updated_at=? WHERE id=? AND status=?""",
+            (now(), now(), task_id, task["status"]))
+        if not cur.rowcount:
+            raise HTTPException(409, "Task state changed; refresh")
+        record(c, "task", f"#{task_id}: 재시도 요청 · 재승인 대기")
+    return get_task(task_id)
+
+
+@app.post("/api/tasks/{task_id}/stop", dependencies=[Depends(auth)])
+def stop_task(task_id: int):
+    if get_task(task_id)["status"] != "running":
+        raise HTTPException(409, "Only running tasks can be stopped")
+    with sessions_lock:
+        stop_requests.add(task_id)
+        session = active_sessions.get(task_id)
+    if session:
+        # The worker sends turn/interrupt and retains its worktree for review.
+        threading.Thread(target=session.interrupt, daemon=True).start()
+    with connect() as c:
+        record(c, "task", f"#{task_id}: 대표가 작업 중단 요청")
+    return {"requested": True, "message": "중단 요청을 전달했습니다. 작업 종료까지 잠시 기다리세요."}
 
 
 @app.post("/api/run-next", dependencies=[Depends(auth)])

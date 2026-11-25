@@ -1,7 +1,7 @@
 ; Nora Studio per-user Windows installer wizard (Inno Setup 6).
 ; Database/configuration live in %LOCALAPPDATA%\NoraStudio, outside {app}.
 #define AppName "Nora Studio"
-#define AppVersion "0.3.4"
+#define AppVersion "0.4.0"
 #define AppExe "NoraStudio.exe"
 
 [Setup]

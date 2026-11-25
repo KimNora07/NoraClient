@@ -25,7 +25,7 @@ echo Building installer with Inno Setup...
 "%NORA_ISCC%" "windows\NoraStudio.iss"
 if errorlevel 1 goto fail
 echo.
-echo SUCCESS: installer-output\NoraStudio-Setup-0.3.4.exe
+echo SUCCESS: installer-output\NoraStudio-Setup-0.4.0.exe
 if /I not "%~1"=="--no-pause" pause
 exit /b 0
 

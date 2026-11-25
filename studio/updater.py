@@ -6,7 +6,7 @@ import re
 import urllib.request
 from pathlib import Path
 
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.4.0"
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 MAX_DOWNLOAD_BYTES = 850 * 1024 * 1024

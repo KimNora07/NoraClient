@@ -1,4 +1,19 @@
-# Nora Studio v0.3.4 — Windows Codex 실행 안정화
+# Nora Studio v0.4.0 — Codex App Server 업무 실행
+
+## v0.4.0 주요 변화
+
+- 승인된 업무는 `codex app-server`의 stdio JSON-RPC 세션으로 실행합니다. 기존 `codex exec` 경로를 대체합니다.
+- 한글 지시문과 이벤트는 UTF-8로 주고받고, Codex 이벤트는 SQLite 작업 로그와 코드 변경 파일에 반영합니다.
+- 실행 중인 업무의 **작업 중단** 및 실패·중단·수정 요청 업무의 **재시도 요청**을 지원합니다.
+- 재시도는 다시 초안으로 돌아가므로 대표가 재승인해야 합니다. 새 실행마다 별도 Git worktree/branch를 만들고 과거 공간은 보존합니다.
+- Codex 앱과 로그인 정보를 공유하는 로컬 Codex 설치를 사용하지만, 이미 열린 Codex 데스크톱 창 자체를 원격 조작하지는 않습니다.
+
+### Windows 필수 확인
+
+PowerShell에서 `codex --version`, `git --version`, `codex login status`를 실행해 설치 및 로그인 상태를 확인하세요.
+Nora Studio의 `config.json`에서 `codexEnabled`를 활성화해야 합니다. 자동 실행을 원하면 `autoRun`도 활성화하세요.
+`NORA_CODEX_TIMEOUT`(초, 기본 1200) 내에 끝나지 않은 업무는 중단되며, 작업 공간은 조사용으로 보존됩니다.
+Codex 내부에서 추가 승인 요청이 필요한 명령은 자동 승인하지 않습니다. 업무 승인과 Codex 내부 명령 승인은 별개입니다.
 
 ## 정식 Windows 설치 마법사 만들기 (NEW)
 
@@ -13,7 +28,7 @@
 빌드가 성공하면 아래 파일이 생성됩니다.
 
 ```text
-nora-studio/installer-output/NoraStudio-Setup-0.3.4.exe
+nora-studio/installer-output/NoraStudio-Setup-0.4.0.exe
 ```
 
 ### 설치 마법사가 제공하는 기능
