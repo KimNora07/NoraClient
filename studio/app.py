@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, SecretStr
-from studio import updater, github_auth
+from studio import updater, github_auth, automation
 
 BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 DATA = Path(os.environ.get("NORA_DATA", str(BASE / "data"))).resolve()
@@ -103,6 +104,7 @@ def init_db():
             title TEXT NOT NULL, event_date TEXT NOT NULL, event_time TEXT,
             category TEXT NOT NULL DEFAULT 'meeting', description TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'scheduled', created_at TEXT NOT NULL)""")
+        automation.initialize(c)
         existing_projects = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
         if "github_repo" not in existing_projects:
             c.execute("ALTER TABLE projects ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''")
@@ -222,9 +224,28 @@ def get_task(task_id):
 
 @asynccontextmanager
 async def lifespan(_):
-    # Legacy SQLite data is preserved; no agent subprocesses run at startup.
+    # Legacy SQLite data is preserved; no coding subprocesses run at startup.
     init_db()
-    yield
+    async def monitor():
+        while True:
+            try:
+                await asyncio.to_thread(automation.poll_github, connect)
+                # One bounded report per interval; avoids monopolizing a laptop GPU.
+                await asyncio.to_thread(automation.process_one, connect, MODEL,
+                                        os.environ.get('NORA_OLLAMA_REPORTS') == '1')
+            except Exception:
+                # A transient credential/network failure must not stop the app.
+                pass
+            await asyncio.sleep(automation.INTERVAL_SECONDS)
+    worker = asyncio.create_task(monitor())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Nora Studio", lifespan=lifespan)
@@ -238,7 +259,7 @@ def index():
 @app.get("/api/health")
 def health(admin: bool = Depends(guest_or_admin)):
     return {"model": MODEL, "mode": "management", "codex_enabled": False,
-            "auto_run": False, "ai_reports_enabled": os.environ.get("NORA_OLLAMA_REPORTS") == "1",
+            "auto_run": False, "monitor_enabled": True, "ai_reports_enabled": os.environ.get("NORA_OLLAMA_REPORTS") == "1",
             "role": "admin" if admin else "guest"}
 
 
@@ -647,6 +668,96 @@ def executive_overview():
                 "decisions":[dict(r) for r in c.execute("SELECT * FROM executive_decisions ORDER BY id DESC LIMIT 50")],
                 "events":[dict(r) for r in c.execute("SELECT * FROM calendar_events ORDER BY event_date,event_time,id LIMIT 200")],
                 "past_days":[dict(r) for r in c.execute("SELECT * FROM workdays ORDER BY id DESC LIMIT 14")]}
+
+
+class AutomationToggle(BaseModel):
+    enabled: bool
+
+
+class AutomationReview(BaseModel):
+    decision: str = Field(pattern='^(approved|rejected)$')
+    note: str = Field(default='', max_length=2000)
+
+
+@app.get('/api/automation/overview', dependencies=[Depends(guest_or_admin)])
+def automation_overview():
+    with connect() as c:
+        return {
+            'paused': automation.setting(c, 'paused') == '1',
+            'monitor_enabled': automation.setting(c, 'monitor_enabled') == '1',
+            'interval_seconds': automation.INTERVAL_SECONDS,
+            'autostart': automation.autostart_status(),
+            'jobs': [dict(r) for r in c.execute('SELECT * FROM automation_jobs ORDER BY id DESC LIMIT 60')],
+            'reports': [dict(r) for r in c.execute('SELECT * FROM automation_reports ORDER BY id DESC LIMIT 50')],
+            'notifications': [dict(r) for r in c.execute('SELECT * FROM automation_notifications ORDER BY id DESC LIMIT 60')],
+            'departments': [{'department': department, 'name': name,
+                             'pending': c.execute("SELECT COUNT(*) FROM automation_jobs WHERE department=? AND status='pending'", (department,)).fetchone()[0],
+                             'completed': c.execute("SELECT COUNT(*) FROM automation_jobs WHERE department=? AND status='done'", (department,)).fetchone()[0],
+                             'running': c.execute("SELECT COUNT(*) FROM automation_jobs WHERE department=? AND status='running'", (department,)).fetchone()[0]}
+                            for department, name in automation.DEPARTMENTS.items()],
+        }
+
+
+@app.post('/api/automation/pause', dependencies=[Depends(auth)])
+def automation_pause(payload: AutomationToggle):
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO automation_settings VALUES('paused',?)",
+                  ('1' if payload.enabled else '0',))
+        record(c, 'automation', 'AI 보고서 및 GitHub 감시 일시 중지' if payload.enabled else 'AI 보고서 및 GitHub 감시 재개')
+    return {'paused': payload.enabled}
+
+
+@app.post('/api/automation/monitor', dependencies=[Depends(auth)])
+def automation_monitor(payload: AutomationToggle):
+    with connect() as c:
+        c.execute("INSERT OR REPLACE INTO automation_settings VALUES('monitor_enabled',?)",
+                  ('1' if payload.enabled else '0',))
+    return {'monitor_enabled': payload.enabled}
+
+
+@app.post('/api/automation/autostart', dependencies=[Depends(auth)])
+def automation_autostart(payload: AutomationToggle):
+    try:
+        automation.windows_autostart(payload.enabled)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {'autostart': automation.autostart_status()}
+
+
+@app.post('/api/automation/check-now', dependencies=[Depends(auth)])
+def automation_check_now():
+    automation.poll_github(connect)
+    return {'ok': True}
+
+
+@app.post('/api/automation/jobs/{job_id}/retry', dependencies=[Depends(auth)])
+def automation_retry(job_id: int):
+    with connect() as c:
+        changed = c.execute("UPDATE automation_jobs SET status='pending',error='',updated_at=? WHERE id=? AND status='failed' AND attempts<3",
+                            (now(), job_id))
+        if not changed.rowcount:
+            raise HTTPException(409, '재시도 가능한 실패 업무가 없습니다 (최대 3회)')
+    return {'ok': True}
+
+
+@app.post('/api/automation/reports/{report_id}/review', dependencies=[Depends(auth)])
+def automation_review(report_id: int, payload: AutomationReview):
+    if payload.decision == 'rejected' and not payload.note.strip():
+        raise HTTPException(422, '반려 사유를 입력하세요')
+    with connect() as c:
+        changed = c.execute("""UPDATE automation_reports SET status=?,decision_note=?,decided_at=?
+            WHERE id=? AND status='pending'""", (payload.decision, payload.note, now(), report_id))
+        if not changed.rowcount:
+            raise HTTPException(409, '결재 대기 보고서가 없습니다')
+        record(c, 'executive', f'자동 부서 보고서 #{report_id} {payload.decision}')
+    return {'ok': True}
+
+
+@app.post('/api/automation/notifications/read', dependencies=[Depends(auth)])
+def automation_notifications_read():
+    with connect() as c:
+        c.execute('UPDATE automation_notifications SET is_read=1 WHERE is_read=0')
+    return {'ok': True}
 
 
 @app.post("/api/executive/clock-in", dependencies=[Depends(auth)])

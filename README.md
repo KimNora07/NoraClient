@@ -1,4 +1,15 @@
-# Nora Studio v0.6.0 — Executive Office
+# Nora Studio v0.7.0 — Executive Office + Background Departments
+
+## v0.7.0 백그라운드 경영 자동화
+
+1. 기존 설치 프로그램으로 업데이트합니다. `%LOCALAPPDATA%\NoraStudio\data\studio.sqlite3`의 기존 데이터는 유지되며, 추가 SQLite 테이블만 생성합니다.
+2. Nora Studio → **직원 활동 현황** → **Windows 자동 시작 설정**을 누릅니다. 설치형 `NoraStudio.exe`에서만 가능하며 사용자 Windows 로그인(`HKCU Run`) 시 트레이에서 자동 실행됩니다. PC가 꺼지면 동작하지 않습니다.
+3. 프로젝트 화면에서 GitHub `owner/repo`를 등록합니다. Private 저장소는 회사 설정에서 읽기 전용 PAT를 연결해야 합니다.
+4. 첫 GitHub 확인은 모니터링 기준점만 저장하며, **이후 신규 커밋**부터 SQLite 작업 큐에 4개 부서 보고 업무가 쌓입니다. GitHub를 5분마다 확인하고 보고서는 5분당 한 건씩 처리합니다.
+5. **대표 알림 센터**에서 근거 커밋, 부서 보고 초안을 확인하고 승인하거나 반려합니다. 보고서 승인만으로 코드나 GitHub가 변경되지는 않습니다.
+6. **AI 일시 중지**는 새로운 GitHub 감시와 보고 생성을 중단합니다. 큐와 기존 자료는 SQLite에 남으며 재개 시 처리합니다.
+
+AI 보고가 필요하면 `%LOCALAPPDATA%\NoraStudio\config.json`의 `aiReportsEnabled`를 `true`로 설정하고 앱을 재시작합니다. 로컬 Ollama가 없는 경우 AI가 작성한 것처럼 표시하지 않고 근거 데이터 브리핑으로 대체합니다. 기본값은 GPU 부하가 없는 사실 브리핑입니다. Codex 앱과 Unity는 별도 실행하며 Nora Studio는 코드를 실행하거나 수정하지 않습니다.
 
 ## v0.6.0 대표 집무실
 
@@ -57,7 +68,7 @@ Unity/C# 프로젝트를 Codex 앱에서 직접 개발하고, Nora Studio에서�
 
 ### 설치형 Windows 앱
 
-GitHub Releases의 `NoraStudio-Setup-0.6.0.exe`를 설치합니다(릴리스 빌드 후 제공).
+GitHub Releases의 `NoraStudio-Setup-0.7.0.exe`를 설치합니다(릴리스 빌드 후 제공).
 앱 실행 시 `config.json`의 `noraToken`으로 관리자 접속할 수 있으며, 토큰 없이 게스트 조회도 가능합니다.
 
 ### Python 개발 실행
@@ -76,7 +87,7 @@ $env:NORA_TOKEN = "여기에-안전한-관리자-토큰"
 ### 설치 파일 직접 빌드
 
 Windows에서 Python 3.12, Inno Setup 6을 설치한 후 `windows\Build-Installer.bat` 실행.
-성공 시 `installer-output\NoraStudio-Setup-0.6.0.exe` 생성.
+성공 시 `installer-output\NoraStudio-Setup-0.7.0.exe` 생성.
 
 ## 업무 흐름
 

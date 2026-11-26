@@ -81,7 +81,7 @@ def port_is_nora(port):
         return False
 
 
-def run_desktop_window(url, server=None):
+def run_desktop_window(url, server=None, background=False):
     """Keep the local dashboard in a standalone Qt window with tray controls."""
     from PySide6.QtCore import QUrl, QTimer
     from PySide6.QtGui import QAction, QIcon, QPixmap
@@ -166,7 +166,24 @@ def run_desktop_window(url, server=None):
         quit_studio()
     update_timer.timeout.connect(check_install_request)
     update_timer.start(1000)
-    window.show()
+    last_notification_id = [0]
+    notification_timer = QTimer(window)
+    def check_notifications():
+        try:
+            with urllib.request.urlopen(url + '/api/automation/overview', timeout=2) as response:
+                items = json.load(response)['notifications']
+            unread = [n for n in items if not n['is_read']]
+            tray.setToolTip(f'Nora Studio — 미확인 알림 {len(unread)}개')
+            if unread and last_notification_id[0] and unread[0]['id'] > last_notification_id[0]:
+                tray.showMessage(unread[0]['title'], unread[0]['message'],
+                                 QSystemTrayIcon.MessageIcon.Information, 5000)
+            last_notification_id[0] = max((n['id'] for n in items), default=0)
+        except (OSError, ValueError, KeyError):
+            pass
+    notification_timer.timeout.connect(check_notifications)
+    notification_timer.start(15000)
+    if not background or not QSystemTrayIcon.isSystemTrayAvailable():
+        window.show()
     return application.exec()
 
 
@@ -178,7 +195,7 @@ def main():
         port = config()
         url = f"http://127.0.0.1:{port}"
         if port_is_nora(port):
-            return run_desktop_window(url)
+            return run_desktop_window(url, background='--background' in sys.argv)
 
         import uvicorn
         from studio.app import app
@@ -199,7 +216,7 @@ def main():
         else:
             raise TimeoutError("서버가 20초 내에 응답하지 않았습니다.")
 
-        run_desktop_window(url, server)
+        run_desktop_window(url, server, background='--background' in sys.argv)
         thread.join(timeout=5)
         return 0
     except Exception as exc:
