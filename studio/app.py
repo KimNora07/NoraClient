@@ -4,6 +4,7 @@ Run with: uvicorn studio.app:app --host 127.0.0.1 --port 8765
 """
 
 import os
+import json
 import re
 import secrets
 import sqlite3
@@ -82,6 +83,26 @@ def init_db():
             project_id INTEGER NOT NULL, sha TEXT NOT NULL, message TEXT NOT NULL,
             author TEXT NOT NULL, committed_at TEXT, url TEXT NOT NULL,
             PRIMARY KEY(project_id, sha))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS workdays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, work_date TEXT NOT NULL UNIQUE,
+            started_at TEXT NOT NULL, ended_at TEXT, focus TEXT NOT NULL DEFAULT '',
+            end_note TEXT NOT NULL DEFAULT '', end_summary TEXT NOT NULL DEFAULT '')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS executive_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workday_id INTEGER NOT NULL,
+            department TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+            evidence_json TEXT NOT NULL, generator TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', decision_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, decided_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS executive_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL,
+            proposal TEXT NOT NULL, workday_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending', decision_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, decided_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER,
+            title TEXT NOT NULL, event_date TEXT NOT NULL, event_time TEXT,
+            category TEXT NOT NULL DEFAULT 'meeting', description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'scheduled', created_at TEXT NOT NULL)""")
         existing_projects = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
         if "github_repo" not in existing_projects:
             c.execute("ALTER TABLE projects ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''")
@@ -217,7 +238,8 @@ def index():
 @app.get("/api/health")
 def health(admin: bool = Depends(guest_or_admin)):
     return {"model": MODEL, "mode": "management", "codex_enabled": False,
-            "auto_run": False, "role": "admin" if admin else "guest"}
+            "auto_run": False, "ai_reports_enabled": os.environ.get("NORA_OLLAMA_REPORTS") == "1",
+            "role": "admin" if admin else "guest"}
 
 
 @app.get("/api/update/check", dependencies=[Depends(auth)])
@@ -557,6 +579,202 @@ def tasks(admin: bool = Depends(guest_or_admin)):
         for t in result:
             t["log"] = ""
     return result
+
+
+# Executive Office v0.6.0 — all writes require CEO authorization.
+class ClockInInput(BaseModel):
+    focus: str = Field(default="", max_length=1000)
+
+
+class ClockOutInput(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+class DepartmentInput(BaseModel):
+    department: str = Field(pattern="^(operations|development|design|qa)$")
+
+
+class ExecutiveDecisionInput(BaseModel):
+    subject: str = Field(min_length=3, max_length=180)
+    proposal: str = Field(min_length=5, max_length=3000)
+
+
+class ExecutiveReviewInput(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected)$")
+    note: str = Field(default="", max_length=2000)
+
+
+class CalendarInput(BaseModel):
+    title: str = Field(min_length=2, max_length=180)
+    event_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    event_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    project_id: int | None = None
+    category: str = Field(default="meeting", pattern="^(meeting|deadline|review|planning)$")
+    description: str = Field(default="", max_length=2000)
+
+
+class CalendarStatusInput(BaseModel):
+    status: str = Field(pattern="^(scheduled|completed|cancelled)$")
+
+
+def local_day():
+    return datetime.now().astimezone().date().isoformat()
+
+
+def snapshot(c):
+    """Only verified database facts, never invented employee activity."""
+    return {
+        "projects": c.execute("SELECT COUNT(*) FROM projects").fetchone()[0],
+        "review_features": c.execute("SELECT COUNT(*) FROM features WHERE status='review'").fetchone()[0],
+        "verified_features": c.execute("SELECT COUNT(*) FROM features WHERE status='verified'").fetchone()[0],
+        "overdue_milestones": c.execute("SELECT COUNT(*) FROM milestones WHERE due_date < ? AND status!='done'",(local_day(),)).fetchone()[0],
+        "commits_recent": [dict(r) for r in c.execute("SELECT message,sha,committed_at,url FROM github_commits ORDER BY committed_at DESC LIMIT 5")],
+        "milestones": [dict(r) for r in c.execute("SELECT title,due_date,status FROM milestones WHERE status!='done' ORDER BY due_date LIMIT 8")],
+    }
+
+
+def current_workday(c):
+    return c.execute("SELECT * FROM workdays WHERE work_date=?",(local_day(),)).fetchone()
+
+
+@app.get("/api/executive/overview", dependencies=[Depends(guest_or_admin)])
+def executive_overview():
+    with connect() as c:
+        day = current_workday(c)
+        return {"today":local_day(),"workday":dict(day) if day else None,
+                "snapshot":snapshot(c),
+                "reports":[dict(r) for r in c.execute("SELECT * FROM executive_reports ORDER BY id DESC LIMIT 30")],
+                "decisions":[dict(r) for r in c.execute("SELECT * FROM executive_decisions ORDER BY id DESC LIMIT 50")],
+                "events":[dict(r) for r in c.execute("SELECT * FROM calendar_events ORDER BY event_date,event_time,id LIMIT 200")],
+                "past_days":[dict(r) for r in c.execute("SELECT * FROM workdays ORDER BY id DESC LIMIT 14")]}
+
+
+@app.post("/api/executive/clock-in", dependencies=[Depends(auth)])
+def executive_clock_in(payload: ClockInInput):
+    with connect() as c:
+        current = current_workday(c)
+        if current:
+            raise HTTPException(409,"오늘의 출근 기록이 이미 있습니다")
+        stamp = now()
+        cur = c.execute("INSERT INTO workdays(work_date,started_at,focus) VALUES(?,?,?)",
+                        (local_day(),stamp,payload.focus))
+        facts = snapshot(c)
+        note = (f"운영 프로젝트 {facts['projects']}개 · 기능 검수 대기 {facts['review_features']}개 · "
+                f"기한 경과 마일스톤 {facts['overdue_milestones']}개 · 최근 수집 커밋 {len(facts['commits_recent'])}개. "
+                "수치는 현재 SQLite에 저장된 자료를 기준으로 합니다.")
+        c.execute("""INSERT INTO executive_reports(workday_id,department,title,body,evidence_json,generator,created_at)
+            VALUES(?,?,?,?,?,?,?)""",(cur.lastrowid,"operations","출근 브리핑",note,
+            json.dumps(facts,ensure_ascii=False),"facts",stamp))
+        record(c,"executive","대표 출근 · 일일 브리핑 생성")
+        return {"workday_id":cur.lastrowid,"briefing":note}
+
+
+@app.post("/api/executive/clock-out", dependencies=[Depends(auth)])
+def executive_clock_out(payload: ClockOutInput):
+    with connect() as c:
+        day = current_workday(c)
+        if not day or day["ended_at"]:
+            raise HTTPException(409,"진행 중인 출근 기록이 없습니다")
+        facts = snapshot(c)
+        summary = (f"오늘 등록된 기준으로 검수 통과 기능 {facts['verified_features']}개, "
+                   f"검수 대기 {facts['review_features']}개. "
+                   f"기한 경과 마일스톤 {facts['overdue_milestones']}개. "
+                   "일간 순증가를 뜻하지 않는 현재 누적값입니다.")
+        c.execute("UPDATE workdays SET ended_at=?,end_note=?,end_summary=? WHERE id=?",
+                  (now(),payload.note,summary,day["id"]))
+        record(c,"executive","대표 퇴근 · 일일 보고 보관")
+        return {"summary":summary}
+
+
+@app.post("/api/executive/reports/generate", dependencies=[Depends(auth)])
+def generate_department_report(payload: DepartmentInput):
+    with connect() as c:
+        day = current_workday(c)
+        if not day or day["ended_at"]:
+            raise HTTPException(409,"출근 후, 퇴근 전에만 부서 보고서를 생성할 수 있습니다")
+        facts = snapshot(c)
+    department_names = {"operations":"운영실장","development":"개발팀장",
+                        "design":"게임기획자","qa":"QA팀장"}
+    dept = department_names[payload.department]
+    fallback = (f"{dept} 데이터 브리핑: 프로젝트 {facts['projects']}개, 검수 대기 {facts['review_features']}개, "
+                f"기한 경과 {facts['overdue_milestones']}개. 최근 커밋은 GitHub 동기화된 기록만 반영합니다. "
+                "실제 개발 품질은 테스트와 대표 검수로 확인해야 합니다.")
+    generator = "facts"
+    body = fallback
+    if os.environ.get("NORA_OLLAMA_REPORTS", "0") == "1":
+        try:
+            result = httpx.post(os.environ.get("NORA_OLLAMA_URL","http://127.0.0.1:11434") + "/api/chat",
+                json={"model":MODEL,"stream":False,"messages":[
+                    {"role":"system","content":f"You are a Korean game studio {dept}. Use ONLY the provided facts. Clearly separate evidence from proposals. Do not claim tests were run or code was completed without evidence. Keep under 350 Korean words."},
+                    {"role":"user","content":json.dumps(facts,ensure_ascii=False)}]}, timeout=35)
+            result.raise_for_status()
+            candidate = result.json()["message"]["content"].strip()
+            if candidate:
+                body = candidate[:4000]
+                generator = "ollama"
+        except (httpx.HTTPError,KeyError,ValueError,TypeError):
+            pass  # Distinguish factual fallback explicitly in the UI.
+    with connect() as c:
+        cur = c.execute("""INSERT INTO executive_reports(workday_id,department,title,body,evidence_json,generator,created_at)
+            VALUES(?,?,?,?,?,?,?)""",(day["id"],payload.department,f"{dept} 업무 보고",body,
+            json.dumps(facts,ensure_ascii=False),generator,now()))
+        record(c,"executive",f"{dept} 보고서 초안 생성 · {generator}")
+        return {"id":cur.lastrowid,"generator":generator}
+
+
+@app.post("/api/executive/reports/{report_id}/review", dependencies=[Depends(auth)])
+def review_executive_report(report_id: int, payload: ExecutiveReviewInput):
+    with connect() as c:
+        cur = c.execute("""UPDATE executive_reports SET status=?,decision_note=?,decided_at=?
+            WHERE id=? AND status='pending'""",(payload.decision,payload.note,now(),report_id))
+        if not cur.rowcount: raise HTTPException(409,"결재 대기 보고서가 없습니다")
+        record(c,"executive",f"보고서 #{report_id} · {payload.decision}")
+    return {"status":payload.decision}
+
+
+@app.post("/api/executive/decisions", dependencies=[Depends(auth)])
+def create_executive_decision(payload: ExecutiveDecisionInput):
+    with connect() as c:
+        day = current_workday(c)
+        cur = c.execute("""INSERT INTO executive_decisions(subject,proposal,workday_id,created_at)
+            VALUES(?,?,?,?)""",(payload.subject,payload.proposal,day["id"] if day else None,now()))
+        record(c,"executive",f"결재 안건 등록: {payload.subject}")
+        return {"id":cur.lastrowid,"status":"pending"}
+
+
+@app.post("/api/executive/decisions/{decision_id}/review", dependencies=[Depends(auth)])
+def review_executive_decision(decision_id: int, payload: ExecutiveReviewInput):
+    with connect() as c:
+        cur = c.execute("""UPDATE executive_decisions SET status=?,decision_note=?,decided_at=?
+            WHERE id=? AND status='pending'""",(payload.decision,payload.note,now(),decision_id))
+        if not cur.rowcount: raise HTTPException(409,"결재 대기 안건이 없습니다")
+        record(c,"executive",f"경영 안건 #{decision_id} · {payload.decision}")
+    return {"status":payload.decision}
+
+
+@app.post("/api/executive/calendar", dependencies=[Depends(auth)])
+def create_calendar_event(payload: CalendarInput):
+    try:
+        datetime.strptime(payload.event_date,"%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(422,"실제 달력 날짜를 입력하세요") from exc
+    with connect() as c:
+        if payload.project_id is not None and not exists(c,"projects",payload.project_id):
+            raise HTTPException(422,"Unknown project")
+        cur = c.execute("""INSERT INTO calendar_events(project_id,title,event_date,event_time,category,description,created_at)
+            VALUES(?,?,?,?,?,?,?)""",(payload.project_id,payload.title,payload.event_date,
+            payload.event_time,payload.category,payload.description,now()))
+        record(c,"calendar",f"일정 등록: {payload.title}")
+        return {"id":cur.lastrowid,"status":"scheduled"}
+
+
+@app.patch("/api/executive/calendar/{event_id}", dependencies=[Depends(auth)])
+def update_calendar_event(event_id: int, payload: CalendarStatusInput):
+    with connect() as c:
+        cur = c.execute("UPDATE calendar_events SET status=? WHERE id=?",(payload.status,event_id))
+        if not cur.rowcount: raise HTTPException(404,"Calendar event not found")
+        record(c,"calendar",f"일정 #{event_id}: {payload.status}")
+    return {"status":payload.status}
 
 
 

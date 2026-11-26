@@ -31,6 +31,7 @@ def config():
         "model": "qwen3:8b",
         "codexEnabled": False,
         "autoRunApprovedTasks": False,
+        "aiReportsEnabled": False,
         "releaseRepo": "KimNora07/NoraClient",
     }
     if not path.exists():
@@ -52,6 +53,7 @@ def config():
     os.environ["NORA_MODEL"] = str(settings.get("model") or "qwen3:8b")
     os.environ["NORA_CODEX_ENABLED"] = "1" if settings.get("codexEnabled") is True else "0"
     os.environ["NORA_AUTO_RUN"] = "1" if settings.get("autoRunApprovedTasks") is True else "0"
+    os.environ["NORA_OLLAMA_REPORTS"] = "1" if settings.get("aiReportsEnabled") is True else "0"
     os.environ["NORA_RELEASE_REPO"] = str(settings.get("releaseRepo") or "")
     return port
 

@@ -1,4 +1,38 @@
-# Nora Studio v0.5.1 — 안정적인 설치 및 Private GitHub 동기화
+# Nora Studio v0.6.0 — Executive Office
+
+## v0.6.0 대표 집무실
+
+- 출근 시 날짜별 업무일(`workdays`)을 생성하고 현재 SQLite 데이터 기반 **출근 브리핑**을 기록합니다. 같은 날 중복 출근은 막습니다.
+- AI 부서 보고는 운영실장, 개발팀장, 기획자, QA 팀장을 대상으로 생성합니다. 기본값은 **규칙 기반 사실 브리핑**이고, `config.json`의 `aiReportsEnabled: true`로 설정하고 Ollama를 실행하면 선택적으로 로컬 AI 초안을 작성합니다. AI를 사용하지 않았을 때는 AI 작성으로 표시하지 않습니다.
+- 보고서와 경영 안건은 각각 독립된 **대표 승인/반려 기록**을 보존합니다. 이 결재는 실제 Git/Unity 프로젝트를 자동으로 수정하지 않습니다.
+- 회사 일정과 회의록용 날짜·시간·프로젝트 연결, 일정 완료·취소 상태를 관리합니다.
+- 퇴근 시 대표 메모와 현재 누적 기능 검수 현황을 분리 기록합니다. 일간 순증가량으로 표시하지 않습니다.
+- 기존 `projects`, `tasks`, `features`, `github_commits` 등 SQLite 데이터는 그대로 보존하고 새 테이블만 추가합니다.
+
+### CEO 근무 시나리오
+
+1. 앱 실행 → **대표 집무실** → `출근하기`
+2. 프로젝트 현황·검수 대기·지연된 마일스톤 브리핑 확인
+3. **부서 보고**에서 필요한 부서의 보고서 초안 생성 후 근거 확인
+4. **전자결재**에서 보고서를 승인·반려하고 경영 안건 기록
+5. **회사 일정**에 회의·검수·마감을 등록
+6. Codex 앱과 Unity에서 직접 개발한 뒤 GitHub 동기화
+7. **퇴근 보고 작성**으로 하루를 마무리
+
+### 로컬 Ollama 선택 사용
+
+`%LOCALAPPDATA%\NoraStudio\config.json`의 `aiReportsEnabled`를 `true`로 설정하고 앱을 재시작하세요.
+모델 이름은 기존 `model` 설정(기본 `qwen3:8b`)을 사용합니다. 비활성화되거나 응답하지 않을 경우에는 AI 결과인 척하지 않고 근거 기반 일반 브리핑으로 돌아갑니다.
+Ollama 결과는 자동 승인되지 않으며, 출처 사실을 재확인할 책임은 대표에게 있습니다.
+
+### 새로운 SQLite 테이블
+
+| 테이블 | 용도 |
+|---|---|
+| `workdays` | 출퇴근 시각, 목표, 퇴근 메모·요약 |
+| `executive_reports` | 부서 보고서, 근거 스냅샷, 생성 방식, 결재 이력 |
+| `executive_decisions` | 경영 안건 및 승인·반려 이력 |
+| `calendar_events` | 회사 회의·일정 및 상태 |
 
 ## v0.5.1 변경 사항
 
@@ -23,7 +57,7 @@ Unity/C# 프로젝트를 Codex 앱에서 직접 개발하고, Nora Studio에서�
 
 ### 설치형 Windows 앱
 
-GitHub Releases의 `NoraStudio-Setup-0.5.1.exe`를 설치합니다(릴리스 빌드 후 제공).
+GitHub Releases의 `NoraStudio-Setup-0.6.0.exe`를 설치합니다(릴리스 빌드 후 제공).
 앱 실행 시 `config.json`의 `noraToken`으로 관리자 접속할 수 있으며, 토큰 없이 게스트 조회도 가능합니다.
 
 ### Python 개발 실행
@@ -42,7 +76,7 @@ $env:NORA_TOKEN = "여기에-안전한-관리자-토큰"
 ### 설치 파일 직접 빌드
 
 Windows에서 Python 3.12, Inno Setup 6을 설치한 후 `windows\Build-Installer.bat` 실행.
-성공 시 `installer-output\NoraStudio-Setup-0.5.1.exe` 생성.
+성공 시 `installer-output\NoraStudio-Setup-0.6.0.exe` 생성.
 
 ## 업무 흐름
 

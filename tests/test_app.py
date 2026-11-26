@@ -141,3 +141,57 @@ def test_migrate_v01_sqlite_without_removing_existing_tables(tmp_path, monkeypat
     with m.connect() as db:
         assert "github_repo" in [x[1] for x in db.execute("PRAGMA table_info(projects)")]
         assert db.execute("SELECT name FROM sqlite_master WHERE name='features'").fetchone()
+
+
+def test_executive_workday_briefing_and_clock_out(tmp_path, monkeypatch):
+    m,c,h = make_client(tmp_path,monkeypatch)
+    try:
+        assert c.post('/api/executive/clock-in',json={'focus':'Arcadia'}).status_code == 401
+        assert c.post('/api/executive/clock-out',headers=h,json={}).status_code == 409
+        assert c.post('/api/executive/clock-in',headers=h,json={'focus':'Arcadia map'}).status_code == 200
+        assert c.post('/api/executive/clock-in',headers=h,json={}).status_code == 409
+        data = c.get('/api/executive/overview').json()
+        assert data['workday']['focus']=='Arcadia map'
+        assert data['reports'][0]['generator']=='facts'
+        assert '운영 프로젝트' in data['reports'][0]['body']
+        assert c.post('/api/executive/reports/generate',headers=h,json={'department':'qa'}).json()['generator']=='facts'
+        report_id=c.get('/api/executive/overview').json()['reports'][0]['id']
+        assert c.post(f'/api/executive/reports/{report_id}/review',headers=h,json={'decision':'approved'}).status_code==200
+        assert c.post(f'/api/executive/reports/{report_id}/review',headers=h,json={'decision':'approved'}).status_code==409
+        assert c.post('/api/executive/clock-out',headers=h,json={'note':'Tomorrow: QA'}).status_code==200
+        assert c.post('/api/executive/reports/generate',headers=h,json={'department':'qa'}).status_code==409
+        assert c.get('/api/executive/overview').json()['workday']['end_note']=='Tomorrow: QA'
+    finally:
+        c.__exit__(None,None,None)
+
+
+def test_executive_decisions_and_calendar_require_approval(tmp_path, monkeypatch):
+    m,c,h = make_client(tmp_path,monkeypatch)
+    try:
+        d=c.post('/api/executive/decisions',headers=h,json={'subject':'New Milestone','proposal':'Move timeline after QA review'}).json()
+        assert d['status']=='pending'
+        assert c.post(f"/api/executive/decisions/{d['id']}/review",headers=h,json={'decision':'approved','note':'Confirmed'}).status_code==200
+        assert c.post(f"/api/executive/decisions/{d['id']}/review",headers=h,json={'decision':'rejected'}).status_code==409
+        assert c.post('/api/executive/calendar',headers=h,json={'title':'Bad date','event_date':'2026-02-30'}).status_code==422
+        ev=c.post('/api/executive/calendar',headers=h,json={'title':'Weekly review','event_date':'2026-12-02','event_time':'10:00'}).json()
+        assert c.patch(f"/api/executive/calendar/{ev['id']}",headers=h,json={'status':'completed'}).status_code==200
+        assert c.get('/api/executive/overview').json()['events'][0]['status']=='completed'
+    finally:
+        c.__exit__(None,None,None)
+
+
+def test_optional_ollama_report_keeps_snapshot_evidence(tmp_path, monkeypatch):
+    m,c,h=make_client(tmp_path,monkeypatch)
+    try:
+        c.post('/api/executive/clock-in',headers=h,json={})
+        monkeypatch.setenv('NORA_OLLAMA_REPORTS','1')
+        class Response:
+            def raise_for_status(self): pass
+            def json(self): return {'message':{'content':'근거: 검수 대기 0개. 제안: 일정 검토.'}}
+        monkeypatch.setattr(m.httpx,'post',lambda *a,**kw:Response())
+        result=c.post('/api/executive/reports/generate',headers=h,json={'department':'operations'}).json()
+        assert result['generator']=='ollama'
+        report=c.get('/api/executive/overview').json()['reports'][0]
+        assert report['evidence_json'] and report['status']=='pending'
+    finally:
+        c.__exit__(None,None,None)
